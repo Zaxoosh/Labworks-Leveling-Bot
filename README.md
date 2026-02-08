@@ -148,4 +148,20 @@ python main.py
 
 ---
 
+## 💎 Sponsorship Tiers
+
+Support the development of Labworks and unlock exclusive in-game and community perks. 
+
+| Tier | Price | Key Perks |
+| :--- | :--- | :--- |
+| **🟢 Intern** | $2 - $5 | @Sponsor Role, **x1.1 XP Booster**, Name in GitHub Credits |
+| **🔵 Alpha Tester** | $10 - $15 | **75 XP/hr Salary**, Priority Sandbox Access, Voting Rights |
+| **🟡 Studio Partner** | $30+ | **Permanent Rank Legend**, Start Rebirths at **Lvl 10**, 2x Daily Gifting |
+
+### How to Sponsor
+Click the "Sponsor" button at the top of this repository or visit our [Sponsors Page](https://github.com/sponsors/Zaxoosh). 
+
+*Sponsorships are processed through GitHub and perks are synced via the `/sponsors` command in Discord.*
+
 *Developed for the Labworks Community.*
+

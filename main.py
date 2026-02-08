@@ -43,10 +43,13 @@ class LevelBot(commands.Bot):
         await self.db.execute("CREATE TABLE IF NOT EXISTS role_multipliers (role_id INTEGER PRIMARY KEY, guild_id INTEGER, multiplier REAL)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS voice_roles (role_id INTEGER PRIMARY KEY, guild_id INTEGER)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS presence_roles (role_id INTEGER PRIMARY KEY, guild_id INTEGER, amount INTEGER)")
+        # Note: level100_salary column kept for DB compatibility but logic removed from config
         await self.db.execute("""CREATE TABLE IF NOT EXISTS guild_settings (guild_id INTEGER PRIMARY KEY, level_channel_id INTEGER DEFAULT 0, birthday_channel_id INTEGER DEFAULT 0, level100_salary INTEGER DEFAULT 0)""")
         await self.db.execute("CREATE TABLE IF NOT EXISTS channel_multipliers (channel_id INTEGER PRIMARY KEY, guild_id INTEGER, multiplier REAL)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS active_boosts (user_id INTEGER, guild_id INTEGER, end_time REAL, multiplier REAL)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS level_roles (level INTEGER, role_id INTEGER, guild_id INTEGER, PRIMARY KEY (level, guild_id))")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS sponsors (user_id INTEGER, guild_id INTEGER, tier_name TEXT, PRIMARY KEY (user_id, guild_id))")
+        
         await self.db.commit()
         
         self.loop.create_task(self.voice_xp_loop())
@@ -137,6 +140,8 @@ class LevelBot(commands.Bot):
             await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(hours=1))
             async with self.db.execute("SELECT role_id, amount FROM presence_roles") as cursor:
                 salaries = {row[0]: row[1] for row in await cursor.fetchall()}
+            
+            # Note: We keep this loop reading the DB just in case, but the UI to set it is gone.
             async with self.db.execute("SELECT guild_id, level100_salary FROM guild_settings") as cursor:
                 lvl100_salaries = {row[0]: row[1] for row in await cursor.fetchall()}
 
@@ -313,6 +318,55 @@ class ChannelActionView(ui.View):
         await bot.db.commit()
         await interaction.response.send_message(f"✅ Birthdays routed to {self.channel.mention}.", ephemeral=True)
 
+# --- SPONSOR MANAGEMENT VIEWS ---
+
+class SponsorTierSelect(ui.Select):
+    def __init__(self, target_user):
+        self.target_user = target_user
+        options = [
+            discord.SelectOption(label="Intern", description="$2-5 Tier", emoji="🟢", value="Intern"),
+            discord.SelectOption(label="Alpha Tester", description="$10-15 Tier", emoji="🔵", value="Alpha Tester"),
+            discord.SelectOption(label="Studio Partner", description="$30+ Tier", emoji="🟡", value="Studio Partner")
+        ]
+        super().__init__(placeholder="Select Sponsorship Tier...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await bot.db.execute("INSERT OR REPLACE INTO sponsors (user_id, guild_id, tier_name) VALUES (?, ?, ?)", 
+                             (self.target_user.id, interaction.guild.id, self.values[0]))
+        await bot.db.commit()
+        await interaction.response.send_message(f"✅ **{self.target_user.name}** is now a **{self.values[0]}** sponsor!", ephemeral=True)
+
+class SponsorUserSelect(ui.UserSelect):
+    def __init__(self, mode="add"):
+        self.mode = mode
+        super().__init__(placeholder="Select a user...")
+
+    async def callback(self, interaction: discord.Interaction):
+        user = self.values[0]
+        if self.mode == "add":
+            view = ui.View()
+            view.add_item(SponsorTierSelect(user))
+            await interaction.response.send_message(f"Select a tier for **{user.name}**:", view=view, ephemeral=True)
+        else:
+            await bot.db.execute("DELETE FROM sponsors WHERE user_id=? AND guild_id=?", (user.id, interaction.guild.id))
+            await bot.db.commit()
+            await interaction.response.send_message(f"🗑️ Removed **{user.name}** from sponsors.", ephemeral=True)
+
+class SponsorSettingsView(ui.View):
+    @ui.button(label="Add Sponsor", style=discord.ButtonStyle.green, emoji="➕")
+    async def add_sponsor_btn(self, interaction: discord.Interaction, button: ui.Button):
+        view = ui.View()
+        view.add_item(SponsorUserSelect(mode="add"))
+        await interaction.response.send_message("Select a user to **ADD** as a sponsor:", view=view, ephemeral=True)
+
+    @ui.button(label="Remove Sponsor", style=discord.ButtonStyle.red, emoji="➖")
+    async def remove_sponsor_btn(self, interaction: discord.Interaction, button: ui.Button):
+        view = ui.View()
+        view.add_item(SponsorUserSelect(mode="remove"))
+        await interaction.response.send_message("Select a user to **REMOVE** from sponsors:", view=view, ephemeral=True)
+
+# --- CONFIG DASHBOARD ---
+
 class ConfigDashboard(ui.View):
     def __init__(self):
         super().__init__()
@@ -323,7 +377,7 @@ class ConfigSelect(ui.Select):
         options = [
             discord.SelectOption(label="Manage Roles", description="Multipliers, Salaries, Voice XP", emoji="🛡️", value="roles"),
             discord.SelectOption(label="Manage Channels", description="Channel Boosts, Routing", emoji="📢", value="channels"),
-            discord.SelectOption(label="Server Settings", description="Lvl 100 Salary, etc.", emoji="⚙️", value="general")
+            discord.SelectOption(label="Sponsor Management", description="Add/Remove Sponsors", emoji="💎", value="general")
         ]
         super().__init__(placeholder="Select a category...", min_values=1, max_values=1, options=options)
 
@@ -355,33 +409,51 @@ class ConfigSelect(ui.Select):
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
         elif self.values[0] == "general":
-            # Simple Modal for Lvl 100 Salary
-            class GeneralModal(ui.Modal, title="General Settings"):
-                salary = ui.TextInput(label="Level 100 Salary (Hourly XP)", placeholder="100")
-                async def on_submit(self, inter: discord.Interaction):
-                    try:
-                        val = int(self.salary.value)
-                        await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (inter.guild.id,))
-                        await bot.db.execute("UPDATE guild_settings SET level100_salary = ? WHERE guild_id = ?", (val, inter.guild.id))
-                        await bot.db.commit()
-                        await inter.response.send_message(f"✅ Level 100s now earn **{val} XP/hr**.", ephemeral=True)
-                    except: await inter.response.send_message("❌ Invalid number.", ephemeral=True)
-            
-            await interaction.response.send_modal(GeneralModal())
+            embed = discord.Embed(title="💎 Sponsor Management", description="Add or Remove sponsors to grant them tier perks.", color=discord.Color.gold())
+            await interaction.response.send_message(embed=embed, view=SponsorSettingsView(), ephemeral=True)
 
-# --- COMMANDS ---
-
+# --- CONFIG COMMAND ---
 @bot.tree.command(name="config", description="Open the Server Configuration Dashboard")
 @app_commands.checks.has_permissions(administrator=True)
 async def config(interaction: discord.Interaction):
     embed = discord.Embed(title="🎛️ Labworks Control Panel", description="Use the dropdown menu below to configure your server's XP system.", color=discord.Color.gold())
     embed.add_field(name="🛡️ Roles", value="Set Multipliers, Salaries, Voice XP, & Level Rewards.", inline=True)
     embed.add_field(name="📢 Channels", value="Set Channel Boosts & Message Routing.", inline=True)
-    embed.add_field(name="⚙️ General", value="Global settings (Lvl 100 Perks).", inline=True)
+    embed.add_field(name="💎 Sponsors", value="Add/Remove Sponsors.", inline=True)
     await interaction.response.send_message(embed=embed, view=ConfigDashboard(), ephemeral=True)
 
 # =========================================
-# 👤 PROFILE SETTINGS (Bio, Birthday, etc)
+# 👑 SPONSOR SYSTEM
+# =========================================
+
+@bot.tree.command(name="sponsors", description="View the legendary supporters of Labworks")
+async def sponsors(interaction: discord.Interaction):
+    async with bot.db.execute("SELECT user_id, tier_name FROM sponsors WHERE guild_id = ?", (interaction.guild.id,)) as cursor:
+        rows = await cursor.fetchall()
+
+    embed = discord.Embed(
+        title="🛡️ Labworks Studio Sponsors",
+        description="The incredible individuals helping us build the future of gaming.",
+        color=discord.Color.gold()
+    )
+
+    if not rows:
+        embed.add_field(name="Current Sponsors", value="No sponsors yet! Be the first to support us.")
+    else:
+        tiers = {"Studio Partner": [], "Alpha Tester": [], "Intern": []}
+        for user_id, tier_name in rows:
+            if tier_name in tiers:
+                tiers[tier_name].append(f"<@{user_id}>")
+        
+        for tier, members in tiers.items():
+            if members:
+                embed.add_field(name=f"✨ {tier}", value="\n".join(members), inline=False)
+
+    embed.set_footer(text="Want to support Labworks? Visit github.com/sponsors/Zaxoosh")
+    await interaction.response.send_message(embed=embed)
+
+# =========================================
+# 👤 PROFILE & RANK
 # =========================================
 
 class ProfileGroup(app_commands.Group):
@@ -424,15 +496,10 @@ class ProfileGroup(app_commands.Group):
 
 bot.tree.add_command(ProfileGroup())
 
-# =========================================
-# 🎁 USER COMMANDS (Rank, Rebirth, Boost)
-# =========================================
-
 @bot.tree.command(name="boost_user", description="Level 150+: Give a 2x XP boost to a friend (1hr)")
 async def boost_user(interaction: discord.Interaction, target: discord.Member):
     async with bot.db.execute("SELECT level, last_gift_used FROM users WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
         d = await c.fetchone()
-    
     if not d or d[0] < 150: return await interaction.response.send_message("❌ You must be **Level 150** to use this.", ephemeral=True)
 
     last_used = d[1]
@@ -447,11 +514,20 @@ async def boost_user(interaction: discord.Interaction, target: discord.Member):
     await bot.db.commit()
     await interaction.response.send_message(f"🎁 **GIFT SENT!** {target.mention} now has a **2x XP Boost** for 1 hour!")
 
-@bot.tree.command(name="rank", description="Check your stats")
-async def rank(interaction: discord.Interaction):
-    async with bot.db.execute("SELECT xp, level, rebirth, bio FROM users WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
+@bot.tree.command(name="rank", description="Check your stats or another user's")
+async def rank(interaction: discord.Interaction, member: discord.Member = None):
+    # Determine target (Member provided, or Author)
+    target = member or interaction.user
+
+    # Fetch User Data
+    async with bot.db.execute("SELECT xp, level, rebirth, bio FROM users WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
         data = await c.fetchone()
     
+    # Fetch Sponsor Data
+    async with bot.db.execute("SELECT tier_name FROM sponsors WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
+        sponsor_data = await c.fetchone()
+    sponsor_tier = sponsor_data[0] if sponsor_data else None
+
     xp, level, rebirth, bio = data if data else (0, 1, 0, "No bio set.")
     xp_needed = 5 * (level ** 2) + (50 * level) + 100
     
@@ -461,8 +537,6 @@ async def rank(interaction: discord.Interaction):
     
     # Boosts Logic
     boosts_text = ""
-    
-    # Channel Boost (Top Priority)
     channel_mult = 1.0
     async with bot.db.execute("SELECT multiplier FROM channel_multipliers WHERE channel_id=?", (interaction.channel.id,)) as c:
         cm_data = await c.fetchone()
@@ -471,33 +545,29 @@ async def rank(interaction: discord.Interaction):
         if channel_mult > 1.0:
             boosts_text += f"⚡ **THIS CHANNEL HAS AN ACTIVE BOOSTER [x{channel_mult}]**\n"
 
-    # Role Boost
     role_mult = 1.0
     async with bot.db.execute("SELECT role_id, multiplier FROM role_multipliers WHERE guild_id=?", (interaction.guild.id,)) as c:
         db_roles = {row[0]: row[1] for row in await c.fetchall()}
-    for role in interaction.user.roles:
+    for role in target.roles:
         if role.id in db_roles:
             role_mult += (db_roles[role.id] - 1.0)
             boosts_text += f"• **{role.name}**: x{db_roles[role.id]}\n"
     
-    # Rebirth Boost
     rebirth_mult = 1.0 + (rebirth * 0.2)
     if rebirth > 0:
         boosts_text += f"• **Rebirth {to_roman(rebirth)}**: x{round(rebirth_mult, 1)}\n"
 
-    # Temp Boost
     temp_mult = 1.0
-    async with bot.db.execute("SELECT end_time, multiplier FROM active_boosts WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
+    async with bot.db.execute("SELECT end_time, multiplier FROM active_boosts WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
         temp = await c.fetchone()
     if temp and temp[0] > time.time():
         temp_mult = temp[1]
         boosts_text += f"• **Friend Gift**: x{temp_mult}\n"
 
-    # Grand Total (Multiplied)
     grand_total_mult = role_mult * rebirth_mult * channel_mult * temp_mult
 
-    embed = discord.Embed(title=f"🛡️ {interaction.user.display_name}", description=f"*{bio}*", color=interaction.user.color)
-    if interaction.user.display_avatar: embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed = discord.Embed(title=f"🛡️ {target.display_name}", description=f"*{bio}*", color=target.color)
+    if target.display_avatar: embed.set_thumbnail(url=target.display_avatar.url)
     
     embed.add_field(name="Level", value=str(level), inline=True)
     embed.add_field(name="Rebirth", value=f"**{to_roman(rebirth)}**", inline=True)
@@ -506,22 +576,24 @@ async def rank(interaction: discord.Interaction):
     
     if boosts_text: embed.add_field(name="🚀 Active Boosts", value=boosts_text, inline=False)
     
+    # SPONSOR FOOTER LOGIC
+    if sponsor_tier == "Studio Partner":
+        embed.set_footer(text="💎 Global Studio Partner | Legend")
+    
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="rebirth", description="Reset to Level 1 for a permanent boost (Level 200+)")
 async def rebirth(interaction: discord.Interaction):
     async with bot.db.execute("SELECT level, rebirth FROM users WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
         data = await c.fetchone()
-    
     if not data or data[0] < 200: return await interaction.response.send_message("❌ You must be **Level 200** to rebirth.", ephemeral=True)
-
     new_rebirth = data[1] + 1
     await bot.db.execute("UPDATE users SET level=1, xp=0, rebirth=? WHERE user_id=? AND guild_id=?", (new_rebirth, interaction.user.id, interaction.guild.id))
     await bot.db.commit()
     await interaction.response.send_message(f"🚨 **REBIRTH!** {interaction.user.mention} is now Rebirth **{to_roman(new_rebirth)}**!")
 
 # =========================================
-# 🛠️ GROUP 2: DEVELOPER TOOLS (Admin Only)
+# 🛠️ DEVELOPER & ERROR
 # =========================================
 
 class DevGroup(app_commands.Group):
@@ -546,7 +618,6 @@ class DevGroup(app_commands.Group):
 
 bot.tree.add_command(DevGroup())
 
-# --- ERROR HANDLER ---
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
