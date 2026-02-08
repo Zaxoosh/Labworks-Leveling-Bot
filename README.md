@@ -1,167 +1,167 @@
-# 🧪 Labworks Leveling Bot
+# Labworks Leveling Bot
 
-A high-performance, multi-server Discord leveling bot built with **discord.py** and **aiosqlite**. Designed for the Labworks community to drive engagement through leveling, rebirths, passive income, and social boosting.
+A multi-server Discord leveling bot built with discord.py and aiosqlite.  
+Designed for the Labworks community to encourage engagement through leveling, rebirths, passive XP, and social boosts.
 
----
-
-## 🚀 Key Features
-
-### 🏗️ Core Systems
-
-* **Multi-Server Architecture:** All level data and configurations are strictly isolated per guild.
-* **Discord Slash Commands:** Fully modern interaction model.
-
-### 🔄 Progression
-
-* **Leveling System:** Scales cleanly across servers.
-* **Rebirth System:**
-
-  * Available at **Level 200+**
-  * Resets user to Level 1
-  * Grants a permanent **x1.2 XP multiplier per rebirth**
-  * Rebirth count displayed in **Roman Numerals**
-
-### 🎭 Roles & Ranks
-
-* **Level Roles (Replace Mode):**
-
-  * Automatically assigns roles at specific levels
-  * New roles replace old ones to keep the member list clean
-
-### 💰 Passive Income & XP Sources
-
-* **Presence Salary:**
-
-  * Configurable hourly XP for staff or specific roles
-* **Level 100 Perk:**
-
-  * Automatic hourly XP salary for all users Level 100+
-* **Voice XP:**
-
-  * Earn XP while in voice channels
-  * Fixed rate at **⅓ of chat XP**
-
-### 🎁 Social & Boosting
-
-* **User Boost Gifting:**
-
-  * Level 150+ users can gift another user a **2× XP boost**
-  * 24-hour cooldown per user
-
-### 🗺️ Dynamic Multipliers
-
-* Role-based XP multipliers
-* Channel-specific XP boosts
-
-### 🎨 Personalization
-
-* **Custom Bios:** Unlock at Level 20+
-* **Custom Level-Up Messages:** Unlock at Level 20+
-
-### 🎂 Birthdays
-
-* Unlock at Level 50+
-* Automatic birthday announcements in-server
+The bot uses a fully isolated per-guild architecture and modern slash commands.
 
 ---
 
-## 🛠️ Technical Stack
+## Features
 
-* **Language:** Python 3.10+
-* **Library:** [discord.py](https://github.com/Rapptz/discord.py)
-* **Database:** SQLite via [aiosqlite](https://github.com/omnilib/aiosqlite)
-* **Architecture:** Slash-command based
+### Core
+- Multi-server support with strict guild data isolation
+- Slash-command only (no legacy prefix commands)
+- Scales cleanly across large servers
+
+### Leveling and Progression
+- XP-based leveling system
+- Rebirth system:
+  - Unlocks at Level 200
+  - Resets level back to 1
+  - Grants a permanent 1.2x XP multiplier per rebirth
+  - Rebirth count displayed using Roman numerals
+
+### Roles and Ranks
+- Level-based role rewards
+- Replace-mode assignment to avoid role stacking
+
+### XP Sources and Passive Income
+- Chat XP
+- Voice XP (one third of chat XP rate)
+- Hourly presence salary for staff or configured roles
+- Automatic hourly XP salary for users Level 100 and above
+
+### Boosting and Social Features
+- Level 150 and above users can gift another user a 2x XP boost
+- 24 hour cooldown per gifter
+
+### Multipliers
+- Role-based XP multipliers
+- Channel-specific XP boosts
+
+### Customization
+- Custom user bios unlocked at Level 20
+- Custom level-up messages unlocked at Level 20
+
+### Birthdays
+- Unlocks at Level 50
+- Automatic birthday announcements in server
 
 ---
 
-## 📦 Installation & Setup
+## Tech Stack
 
-### 1️⃣ Clone the Repository
+- Python 3.10 or higher
+- discord.py
+- SQLite using aiosqlite
+- Slash command based architecture
 
-```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
+---
+
+## Installation
+
+Clone the repository:
+
+git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git  
 cd YOUR_REPO_NAME
-```
 
-### 2️⃣ Install Dependencies
+Install dependencies:
 
-```bash
 pip install -r requirements.txt
-```
 
-### 3️⃣ Environment Configuration
+Create an environment file in the project root named .env:
 
-Create a `.env` file in the project root:
-
-```env
 DISCORD_TOKEN=your_bot_token_here
-```
 
-### 4️⃣ Database Initialization
+Database notes:
+- The database file levels.db is created automatically on first run
 
-* The bot automatically creates `levels.db` on first run.
+Run the bot:
 
-### 5️⃣ Run the Bot
-
-```bash
 python main.py
-```
 
 ---
 
-## 🎮 Command Reference
+## Commands
 
-### 👤 User Commands
+### User Commands
+- /rank – View your level, XP progress, and active boosts
+- /rebirth – Reset to Level 1 for a permanent XP multiplier (Level 200 and above)
+- /profile bio – Set a profile bio (Level 20 and above)
+- /profile levelup_msg – Customize your level-up message (Level 20 and above)
+- /profile birthday – Set your birthday (Level 50 and above)
+- /boost_user – Gift a 2x XP boost to another user (Level 150 and above)
 
-* `/rank` — View level, XP progress bar, and active boosts
-* `/rebirth` — Reset to Level 1 for a permanent XP multiplier (Level 200+)
-* `/profile bio` — Set your profile bio (Level 20+)
-* `/profile levelup_msg` — Customize your level-up message (Level 20+)
-* `/profile birthday` — Set your birthday (Level 50+)
-* `/boost_user` — Gift a 1-hour 2× XP boost (Level 150+)
+### Admin and Configuration Commands (/config)
+- set_multiplier – Assign XP multipliers to roles
+- set_channel_boost – Assign XP multipliers to channels
+- level_role – Configure level-based roles using replace mode
+- salary_role – Set hourly XP salary for roles
+- salary_level100 – Configure Level 100 and above passive salary
+- ping_channel – Set the level-up announcement channel
+- view – View the current server configuration
 
-### 🛠️ Admin / Configuration (`/config`)
-
-* `set_multiplier` — Assign XP multipliers to roles
-* `set_channel_boost` — Assign XP multipliers to channels
-* `level_role` — Map roles to levels (replace mode)
-* `salary_role` — Set hourly XP salary for specific roles
-* `salary_level100` — Configure Level 100+ passive salary
-* `ping_channel` — Set channel for level-up announcements
-* `view` — View all current server settings
-
-### 🧪 Developer Tools (`/dev`)
-
-* `set_level` — Force set a user's level
-* `set_rebirth` — Force set a user's rebirth count
+### Developer Commands (/dev)
+- set_level – Force set a user’s level
+- set_rebirth – Force set a user’s rebirth count
 
 ---
 
-## ⚠️ Security Notes
+## Roadmap
 
-* **Never** commit `.env` or `levels.db` to GitHub
-* Use the provided `.gitignore`
-* Enable the following intents in the Discord Developer Portal:
+Planned features and improvements:
 
-  * **Server Members Intent**
-  * **Message Content Intent**
+- Leaderboards (global and per-server) ✅
+- Server boss fights
+- Web dashboard for configuration and statistics
+- Seasonal XP events
+- Advanced anti XP abuse detection
+- Database migration support such as PostgreSQL
+
+
+## Suggestions and Feedback
+
+Suggestions, feature requests, and bug reports are welcome.
+
+Please submit all suggestions and issues through GitHub Issues.  
+Using GitHub Issues keeps feedback organised, visible, and easy to track.
 
 ---
 
-## 💎 Sponsorship Tiers
+## Security Notes
 
-Support the development of Labworks and unlock exclusive in-game and community perks. 
+- Do not commit the .env file or levels.db to version control
+- Use the provided .gitignore file
+- Enable the following intents in the Discord Developer Portal:
+  - Server Members Intent
+  - Message Content Intent
 
-| Tier | Price | Key Perks |
-| :--- | :--- | :--- |
-| **🟢 Intern** | $2 - $5 | @Sponsor Role, **x1.1 XP Booster**, Name in GitHub Credits |
-| **🔵 Alpha Tester** | $10 - $15 | **75 XP/hr Salary**, Priority Sandbox Access, Voting Rights |
-| **🟡 Studio Partner** | $30+ | **Permanent Rank Legend**, Start Rebirths at **Lvl 10**, 2x Daily Gifting |
+---
 
-### How to Sponsor
-Click the "Sponsor" button at the top of this repository or visit our [Sponsors Page](https://github.com/sponsors/Zaxoosh). 
+## Sponsorship
 
-*Sponsorships are processed through GitHub and perks are synced via the `/sponsors` command in Discord.*
+Support the development of Labworks and unlock in-game and community perks.
 
-*Developed for the Labworks Community.*
+Tier: Intern  
+Price: 2 USD  
+Perks: Sponsor role, 1.1x XP boost, GitHub credits
 
+Tier: Alpha Tester  
+Price: 5 USD  
+Perks: 75 XP per hour salary, sandbox priority access, voting rights
+
+Tier: Studio Partner  
+Price: 30 USD
+Perks: Permanent Legend rank, rebirths unlocked at Level 10, double daily gifting
+
+Sponsorships are handled through GitHub Sponsors and synced in Discord using the /sponsors command.
+
+https://github.com/sponsors/Zaxoosh
+
+---
+
+## License and Credits
+
+Developed for the Labworks Community.  
+Contributions, issues, and pull requests are welcome.
