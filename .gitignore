@@ -1,4 +1,14 @@
+# Credentials
 .env
+
+# Database
 levels.db
+
+# Python Folders
 __pycache__/
-*.log
+*.py[cod]
+*$py.class
+
+# Environments
+venv/
+env/

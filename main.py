@@ -1,6 +1,6 @@
 import discord
-from discord import app_commands
-from discord.ext import commands, tasks
+from discord import app_commands, ui
+from discord.ext import commands
 import os
 import aiosqlite
 import random
@@ -15,18 +15,8 @@ TEST_GUILD = discord.Object(id=TEST_GUILD_ID)
 
 # --- ROMAN NUMERAL HELPER ---
 def to_roman(num):
-    val = [
-        1000, 900, 500, 400,
-        100, 90, 50, 40,
-        10, 9, 5, 4,
-        1
-    ]
-    syb = [
-        "M", "CM", "D", "CD",
-        "C", "XC", "L", "XL",
-        "X", "IX", "V", "IV",
-        "I"
-    ]
+    val = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+    syb = ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
     roman_num = ''
     i = 0
     while  num > 0:
@@ -36,6 +26,7 @@ def to_roman(num):
         i += 1
     return roman_num if roman_num else "0"
 
+# --- DB SETUP ---
 class LevelBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -47,51 +38,21 @@ class LevelBot(commands.Bot):
     async def setup_hook(self):
         self.db = await aiosqlite.connect("levels.db")
         
-        # 1. Users Table
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER,
-                guild_id INTEGER,
-                xp INTEGER DEFAULT 0,
-                level INTEGER DEFAULT 1,
-                rebirth INTEGER DEFAULT 0,
-                next_xp_time REAL DEFAULT 0,
-                bio TEXT DEFAULT 'No bio set.',
-                custom_msg TEXT DEFAULT NULL,
-                birthday TEXT DEFAULT NULL,
-                last_gift_used REAL DEFAULT 0,
-                PRIMARY KEY (user_id, guild_id)
-            )
-        """)
-        
-        # 2. Config Tables
+        # TABLES
+        await self.db.execute("""CREATE TABLE IF NOT EXISTS users (user_id INTEGER, guild_id INTEGER, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1, rebirth INTEGER DEFAULT 0, next_xp_time REAL DEFAULT 0, bio TEXT DEFAULT 'No bio set.', custom_msg TEXT DEFAULT NULL, birthday TEXT DEFAULT NULL, last_gift_used REAL DEFAULT 0, PRIMARY KEY (user_id, guild_id))""")
         await self.db.execute("CREATE TABLE IF NOT EXISTS role_multipliers (role_id INTEGER PRIMARY KEY, guild_id INTEGER, multiplier REAL)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS voice_roles (role_id INTEGER PRIMARY KEY, guild_id INTEGER)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS presence_roles (role_id INTEGER PRIMARY KEY, guild_id INTEGER, amount INTEGER)")
-        
-        # 3. Settings & Channel Multipliers
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id INTEGER PRIMARY KEY, 
-                level_channel_id INTEGER DEFAULT 0, 
-                birthday_channel_id INTEGER DEFAULT 0, 
-                level100_salary INTEGER DEFAULT 0
-            )
-        """)
+        await self.db.execute("""CREATE TABLE IF NOT EXISTS guild_settings (guild_id INTEGER PRIMARY KEY, level_channel_id INTEGER DEFAULT 0, birthday_channel_id INTEGER DEFAULT 0, level100_salary INTEGER DEFAULT 0)""")
         await self.db.execute("CREATE TABLE IF NOT EXISTS channel_multipliers (channel_id INTEGER PRIMARY KEY, guild_id INTEGER, multiplier REAL)")
         await self.db.execute("CREATE TABLE IF NOT EXISTS active_boosts (user_id INTEGER, guild_id INTEGER, end_time REAL, multiplier REAL)")
-
-        # 4. Level Roles (Level -> Role ID)
         await self.db.execute("CREATE TABLE IF NOT EXISTS level_roles (level INTEGER, role_id INTEGER, guild_id INTEGER, PRIMARY KEY (level, guild_id))")
-
         await self.db.commit()
         
-        # Background Tasks
         self.loop.create_task(self.voice_xp_loop())
         self.loop.create_task(self.presence_xp_loop())
         self.loop.create_task(self.birthday_loop())
 
-        # Sync Commands
         self.tree.copy_global_to(guild=TEST_GUILD)
         await self.tree.sync(guild=TEST_GUILD)
         print("✅ Bot Online & Synced")
@@ -100,40 +61,32 @@ class LevelBot(commands.Bot):
         await self.db.close()
         await super().close()
     
-    # --- SHARED XP ADDER (Includes Role Swapping Logic) ---
+    # --- LOGIC ---
     async def add_xp(self, member, amount):
-        async with self.db.execute("SELECT xp, level, rebirth, custom_msg FROM users WHERE user_id = ? AND guild_id = ?", 
-                                   (member.id, member.guild.id)) as cursor:
+        async with self.db.execute("SELECT xp, level, rebirth, custom_msg FROM users WHERE user_id = ? AND guild_id = ?", (member.id, member.guild.id)) as cursor:
             data = await cursor.fetchone()
-            
         if not data:
-            await self.db.execute("INSERT INTO users (user_id, guild_id, xp, level, rebirth) VALUES (?, ?, ?, ?, ?)", 
-                                 (member.id, member.guild.id, amount, 1, 0))
+            await self.db.execute("INSERT INTO users (user_id, guild_id, xp, level, rebirth) VALUES (?, ?, ?, ?, ?)", (member.id, member.guild.id, amount, 1, 0))
             await self.db.commit()
             return False, 1, None
 
         current_xp, current_level, current_rebirth, custom_msg = data
         
-        # 1. Multipliers
+        # Multipliers
         rebirth_mult = 1.0 + (current_rebirth * 0.2)
         role_mult = await calculate_multiplier(member)
-        
-        # 2. Temp Boosts (Gifts)
         temp_mult = 1.0
         now = time.time()
-        await self.db.execute("DELETE FROM active_boosts WHERE end_time < ?", (now,)) # Clean old
+        await self.db.execute("DELETE FROM active_boosts WHERE end_time < ?", (now,))
         await self.db.commit()
-        
         async with self.db.execute("SELECT multiplier FROM active_boosts WHERE user_id=? AND guild_id=?", (member.id, member.guild.id)) as c:
             boost_data = await c.fetchone()
             if boost_data: temp_mult = boost_data[0]
 
         final_xp = int(amount * rebirth_mult * role_mult * temp_mult)
-        
         new_xp = current_xp + final_xp
         xp_needed = 5 * (current_level ** 2) + (50 * current_level) + 100
         
-        # Level Up Loop
         did_level_up = False
         while new_xp >= xp_needed:
             if current_level >= 200:
@@ -144,39 +97,25 @@ class LevelBot(commands.Bot):
             xp_needed = 5 * (current_level ** 2) + (50 * current_level) + 100
             did_level_up = True
 
-        # --- LEVEL ROLE LOGIC (REPLACE MODE) ---
         if did_level_up:
-            # Get all configured level roles for this guild
             async with self.db.execute("SELECT level, role_id FROM level_roles WHERE guild_id = ?", (member.guild.id,)) as c:
                 all_level_roles = await c.fetchall()
-            
             level_map = {row[0]: row[1] for row in all_level_roles}
-            
-            # If the NEW level has a role assigned
             if current_level in level_map:
                 new_role_id = level_map[current_level]
                 new_role = member.guild.get_role(new_role_id)
-                
-                # Identify roles to remove (Any configured level role that isn't the new one)
                 roles_to_remove = []
-                all_configured_ids = set(level_map.values())
-                
+                all_ids = set(level_map.values())
                 for role in member.roles:
-                    if role.id in all_configured_ids and role.id != new_role_id:
+                    if role.id in all_ids and role.id != new_role_id:
                         roles_to_remove.append(role)
-                
                 try:
-                    if roles_to_remove:
-                        await member.remove_roles(*roles_to_remove, reason=f"Level Up to {current_level} (Replace Mode)")
-                    if new_role:
-                        await member.add_roles(new_role, reason=f"Level Up to {current_level}")
-                except discord.Forbidden:
-                    print(f"⚠️ Missing Permissions: Could not swap roles for {member.name}")
+                    if roles_to_remove: await member.remove_roles(*roles_to_remove)
+                    if new_role: await member.add_roles(new_role)
+                except: pass
 
-        await self.db.execute("UPDATE users SET xp = ?, level = ? WHERE user_id = ? AND guild_id = ?", 
-                             (new_xp, current_level, member.id, member.guild.id))
+        await self.db.execute("UPDATE users SET xp = ?, level = ? WHERE user_id = ? AND guild_id = ?", (new_xp, current_level, member.id, member.guild.id))
         await self.db.commit()
-        
         return did_level_up, current_level, custom_msg
 
     # --- LOOPS ---
@@ -186,7 +125,6 @@ class LevelBot(commands.Bot):
             await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(minutes=1))
             async with self.db.execute("SELECT role_id FROM voice_roles") as cursor:
                 voice_ids = {row[0] for row in await cursor.fetchall()}
-            
             for guild in self.guilds:
                 for member in guild.members:
                     if member.voice and not member.voice.self_deaf and not member.bot:
@@ -197,8 +135,6 @@ class LevelBot(commands.Bot):
         await self.wait_until_ready()
         while not self.is_closed():
             await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(hours=1))
-            
-            # Salaries
             async with self.db.execute("SELECT role_id, amount FROM presence_roles") as cursor:
                 salaries = {row[0]: row[1] for row in await cursor.fetchall()}
             async with self.db.execute("SELECT guild_id, level100_salary FROM guild_settings") as cursor:
@@ -208,15 +144,11 @@ class LevelBot(commands.Bot):
                 lvl100_amount = lvl100_salaries.get(guild.id, 0)
                 for member in guild.members:
                     if member.bot: continue
-                    total = 0
-                    total += sum(salaries[r.id] for r in member.roles if r.id in salaries)
-                    
+                    total = sum(salaries[r.id] for r in member.roles if r.id in salaries)
                     if lvl100_amount > 0:
                         async with self.db.execute("SELECT level FROM users WHERE user_id=? AND guild_id=?", (member.id, guild.id)) as c:
                             ud = await c.fetchone()
-                            if ud and ud[0] >= 100:
-                                total += lvl100_amount
-
+                            if ud and ud[0] >= 100: total += lvl100_amount
                     if total > 0: await self.add_xp(member, total)
 
     async def birthday_loop(self):
@@ -226,7 +158,6 @@ class LevelBot(commands.Bot):
             today_str = now.strftime("%d-%m")
             async with self.db.execute("SELECT user_id, guild_id FROM users WHERE birthday = ?", (today_str,)) as cursor:
                 birthdays = await cursor.fetchall()
-            
             for user_id, guild_id in birthdays:
                 guild = self.get_guild(guild_id)
                 if not guild: continue
@@ -234,13 +165,11 @@ class LevelBot(commands.Bot):
                     s = await c.fetchone()
                 if s and s[0] != 0:
                     channel = guild.get_channel(s[0])
-                    if channel:
-                        await channel.send(f"🎂 Happy Birthday <@{user_id}>! Hope you have a fantastic day! 🎉")
+                    if channel: await channel.send(f"🎂 Happy Birthday <@{user_id}>! Hope you have a fantastic day! 🎉")
             await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(days=1))
 
 bot = LevelBot()
 
-# --- HELPER ---
 async def calculate_multiplier(member):
     async with bot.db.execute("SELECT role_id, multiplier FROM role_multipliers WHERE guild_id = ?", (member.guild.id,)) as cursor:
         rows = await cursor.fetchall()
@@ -252,125 +181,204 @@ async def calculate_multiplier(member):
             if bonus > 0: total += bonus
     return total
 
-# --- CHAT EVENT ---
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild: return
-    
     current_time = time.time()
     
-    # Check Channel Multipliers
     channel_mult = 1.0
     async with bot.db.execute("SELECT multiplier FROM channel_multipliers WHERE channel_id=?", (message.channel.id,)) as c:
         cm_data = await c.fetchone()
         if cm_data: channel_mult = cm_data[0]
 
-    # Cooldown Check
     async with bot.db.execute("SELECT next_xp_time FROM users WHERE user_id=? AND guild_id=?", (message.author.id, message.guild.id)) as cursor:
         data = await cursor.fetchone()
-        
-    next_time = data[0] if data else 0
-    if current_time < next_time: return
+    if current_time < (data[0] if data else 0): return
 
-    # Add XP
-    base_xp = random.randint(15, 25)
-    final_amount = int(base_xp * channel_mult)
-    
-    leveled_up, new_level, custom_msg = await bot.add_xp(message.author, final_amount)
+    leveled_up, new_level, custom_msg = await bot.add_xp(message.author, int(random.randint(15, 25) * channel_mult))
     
     if leveled_up:
-        # Routing Message
         async with bot.db.execute("SELECT level_channel_id FROM guild_settings WHERE guild_id=?", (message.guild.id,)) as c:
             s = await c.fetchone()
+        target = message.guild.get_channel(s[0]) if s and s[0] != 0 else message.channel
         
-        target_channel = message.channel
-        if s and s[0] != 0:
-            found_channel = message.guild.get_channel(s[0])
-            if found_channel: target_channel = found_channel
+        if new_level == 75: await target.send(f"💀 {message.author.mention} hit **Level 75**. Welcome back from inactivity...")
+        elif custom_msg: await target.send(custom_msg.replace("{user}", message.author.mention).replace("{level}", str(new_level)))
+        else: await target.send(f"🎉 {message.author.mention} reached **Level {new_level}**!")
 
-        # Messages
-        if new_level == 75:
-            funny_msgs = [
-                f"😲 {message.author.mention} hit **Level 75**! Do you remember what grass looks like?",
-                f"💀 {message.author.mention} is **Level 75**. Welcome back from your inactivity...",
-                f"🚨 **Level 75 Alert!** {message.author.mention} has officially been here too long."
-            ]
-            await target_channel.send(random.choice(funny_msgs))
-        elif custom_msg:
-            msg = custom_msg.replace("{user}", message.author.mention).replace("{level}", str(new_level))
-            await target_channel.send(msg)
-        else:
-            await target_channel.send(f"🎉 {message.author.mention} has reached **Level {new_level}**!")
-
-    # Random Cooldown 15-30s
-    new_time = current_time + random.randint(15, 30)
-    await bot.db.execute("UPDATE users SET next_xp_time=? WHERE user_id=? AND guild_id=?", (new_time, message.author.id, message.guild.id))
+    await bot.db.execute("UPDATE users SET next_xp_time=? WHERE user_id=? AND guild_id=?", (current_time + random.randint(15, 30), message.author.id, message.guild.id))
     await bot.db.commit()
 
 # =========================================
-# 🛠️ GROUP 1: CONFIGURATION (Admin Only)
+# 🎛️ DASHBOARD UI (THE CONFIG MENU)
 # =========================================
 
-class ConfigGroup(app_commands.Group):
+# --- INPUT MODALS ---
+
+class MultiplierModal(ui.Modal, title="XP Multiplier"):
+    amount = ui.TextInput(label="Multiplier (e.g. 1.5)", placeholder="1.5")
+    def __init__(self, target_id, is_role=True):
+        super().__init__()
+        self.target_id = target_id
+        self.is_role = is_role
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            val = float(self.amount.value)
+            if val < 1.0: raise ValueError
+            table = "role_multipliers" if self.is_role else "channel_multipliers"
+            col = "role_id" if self.is_role else "channel_id"
+            await bot.db.execute(f"INSERT OR REPLACE INTO {table} ({col}, guild_id, multiplier) VALUES (?, ?, ?)", (self.target_id, interaction.guild.id, val))
+            await bot.db.commit()
+            await interaction.response.send_message(f"✅ Set **x{val}** multiplier.", ephemeral=True)
+        except:
+            await interaction.response.send_message("❌ Invalid number.", ephemeral=True)
+
+class SalaryModal(ui.Modal, title="Hourly Salary"):
+    amount = ui.TextInput(label="XP Amount (e.g. 50)", placeholder="50")
+    def __init__(self, role_id):
+        super().__init__()
+        self.role_id = role_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            val = int(self.amount.value)
+            await bot.db.execute("INSERT OR REPLACE INTO presence_roles (role_id, guild_id, amount) VALUES (?, ?, ?)", (self.role_id, interaction.guild.id, val))
+            await bot.db.commit()
+            await interaction.response.send_message(f"✅ Set salary to **{val} XP/hr**.", ephemeral=True)
+        except:
+            await interaction.response.send_message("❌ Invalid integer.", ephemeral=True)
+
+class LevelRoleModal(ui.Modal, title="Level Requirement"):
+    level = ui.TextInput(label="Level to unlock role", placeholder="10")
+    def __init__(self, role_id):
+        super().__init__()
+        self.role_id = role_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            val = int(self.level.value)
+            if val < 2: raise ValueError
+            await bot.db.execute("INSERT OR REPLACE INTO level_roles (level, role_id, guild_id) VALUES (?, ?, ?)", (val, self.role_id, interaction.guild.id))
+            await bot.db.commit()
+            await interaction.response.send_message(f"✅ Role will be given at **Level {val}**.", ephemeral=True)
+        except:
+            await interaction.response.send_message("❌ Invalid Level (Must be 2+).", ephemeral=True)
+
+# --- VIEWS & SELECTS ---
+
+class RoleActionView(ui.View):
+    def __init__(self, role):
+        super().__init__()
+        self.role = role
+
+    @ui.button(label="Set XP Booster", style=discord.ButtonStyle.blurple)
+    async def set_boost(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(MultiplierModal(self.role.id, is_role=True))
+
+    @ui.button(label="Set Salary", style=discord.ButtonStyle.green)
+    async def set_salary(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(SalaryModal(self.role.id))
+
+    @ui.button(label="Enable Voice XP", style=discord.ButtonStyle.grey)
+    async def set_voice(self, interaction: discord.Interaction, button: ui.Button):
+        await bot.db.execute("INSERT OR IGNORE INTO voice_roles (role_id, guild_id) VALUES (?, ?)", (self.role.id, interaction.guild.id))
+        await bot.db.commit()
+        await interaction.response.send_message(f"✅ Voice XP enabled for {self.role.mention}.", ephemeral=True)
+        
+    @ui.button(label="Assign to Level...", style=discord.ButtonStyle.primary)
+    async def set_level_role(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(LevelRoleModal(self.role.id))
+
+class ChannelActionView(ui.View):
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel
+
+    @ui.button(label="Set XP Multiplier", style=discord.ButtonStyle.blurple)
+    async def set_boost(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(MultiplierModal(self.channel.id, is_role=False))
+
+    @ui.button(label="Route Level Ups Here", style=discord.ButtonStyle.green)
+    async def set_route(self, interaction: discord.Interaction, button: ui.Button):
+        await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
+        await bot.db.execute("UPDATE guild_settings SET level_channel_id = ? WHERE guild_id = ?", (self.channel.id, interaction.guild.id))
+        await bot.db.commit()
+        await interaction.response.send_message(f"✅ Level ups routed to {self.channel.mention}.", ephemeral=True)
+
+    @ui.button(label="Route Birthdays Here", style=discord.ButtonStyle.primary)
+    async def set_bday(self, interaction: discord.Interaction, button: ui.Button):
+        await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
+        await bot.db.execute("UPDATE guild_settings SET birthday_channel_id = ? WHERE guild_id = ?", (self.channel.id, interaction.guild.id))
+        await bot.db.commit()
+        await interaction.response.send_message(f"✅ Birthdays routed to {self.channel.mention}.", ephemeral=True)
+
+class ConfigDashboard(ui.View):
     def __init__(self):
-        super().__init__(name="config", description="Manage Server Settings")
+        super().__init__()
+        self.add_item(ConfigSelect())
 
-    @app_commands.command(name="set_multiplier", description="Set a role as an XP Booster")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def set_multiplier(self, interaction: discord.Interaction, role: discord.Role, multiplier: float):
-        await bot.db.execute("INSERT OR REPLACE INTO role_multipliers (role_id, guild_id, multiplier) VALUES (?, ?, ?)", (role.id, interaction.guild.id, multiplier))
-        await bot.db.commit()
-        await interaction.response.send_message(f"✅ **{role.name}** is now a **x{multiplier}** Booster!", ephemeral=True)
+class ConfigSelect(ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Manage Roles", description="Multipliers, Salaries, Voice XP", emoji="🛡️", value="roles"),
+            discord.SelectOption(label="Manage Channels", description="Channel Boosts, Routing", emoji="📢", value="channels"),
+            discord.SelectOption(label="Server Settings", description="Lvl 100 Salary, etc.", emoji="⚙️", value="general")
+        ]
+        super().__init__(placeholder="Select a category...", min_values=1, max_values=1, options=options)
 
-    @app_commands.command(name="set_channel_boost", description="Set a channel as an XP Booster")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def set_channel_boost(self, interaction: discord.Interaction, channel: discord.TextChannel, multiplier: float):
-        await bot.db.execute("INSERT OR REPLACE INTO channel_multipliers (channel_id, guild_id, multiplier) VALUES (?, ?, ?)", (channel.id, interaction.guild.id, multiplier))
-        await bot.db.commit()
-        await interaction.response.send_message(f"✅ **{channel.mention}** now gives **x{multiplier}** XP!", ephemeral=True)
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "roles":
+            embed = discord.Embed(title="🛡️ Role Configuration", description="Select a role below to configure its Salary, Multiplier, or Voice settings.", color=discord.Color.blue())
+            view = ui.View()
+            role_select = ui.RoleSelect(placeholder="Pick a role to edit...")
+            
+            async def role_callback(inter: discord.Interaction):
+                role = role_select.values[0]
+                await inter.response.send_message(f"⚙️ Configure **{role.name}**:", view=RoleActionView(role), ephemeral=True)
+            
+            role_select.callback = role_callback
+            view.add_item(role_select)
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="level_role", description="Assign a role to a level (Replaces previous level roles)")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def level_role(self, interaction: discord.Interaction, level: int, role: discord.Role):
-        if level < 2: return await interaction.response.send_message("❌ Level must be 2 or higher.", ephemeral=True)
-        await bot.db.execute("INSERT OR REPLACE INTO level_roles (level, role_id, guild_id) VALUES (?, ?, ?)", (level, role.id, interaction.guild.id))
-        await bot.db.commit()
-        await interaction.response.send_message(f"✅ Users reaching **Level {level}** will now receive **{role.mention}** (and lose previous level roles).", ephemeral=True)
+        elif self.values[0] == "channels":
+            embed = discord.Embed(title="📢 Channel Configuration", description="Select a channel below to configure Multipliers or Message Routing.", color=discord.Color.green())
+            view = ui.View()
+            chan_select = ui.ChannelSelect(channel_types=[discord.ChannelType.text, discord.ChannelType.voice], placeholder="Pick a channel...")
+            
+            async def chan_callback(inter: discord.Interaction):
+                chan = chan_select.values[0]
+                await inter.response.send_message(f"⚙️ Configure **{chan.name}**:", view=ChannelActionView(chan), ephemeral=True)
+                
+            chan_select.callback = chan_callback
+            view.add_item(chan_select)
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="salary_role", description="Give a role hourly passive XP")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def salary_role(self, interaction: discord.Interaction, role: discord.Role, hourly_amount: int):
-        await bot.db.execute("INSERT OR REPLACE INTO presence_roles (role_id, guild_id, amount) VALUES (?, ?, ?)", (role.id, interaction.guild.id, hourly_amount))
-        await bot.db.commit()
-        await interaction.response.send_message(f"✅ **{role.name}** now earns **{hourly_amount} XP** every hour.", ephemeral=True)
+        elif self.values[0] == "general":
+            # Simple Modal for Lvl 100 Salary
+            class GeneralModal(ui.Modal, title="General Settings"):
+                salary = ui.TextInput(label="Level 100 Salary (Hourly XP)", placeholder="100")
+                async def on_submit(self, inter: discord.Interaction):
+                    try:
+                        val = int(self.salary.value)
+                        await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (inter.guild.id,))
+                        await bot.db.execute("UPDATE guild_settings SET level100_salary = ? WHERE guild_id = ?", (val, inter.guild.id))
+                        await bot.db.commit()
+                        await inter.response.send_message(f"✅ Level 100s now earn **{val} XP/hr**.", ephemeral=True)
+                    except: await inter.response.send_message("❌ Invalid number.", ephemeral=True)
+            
+            await interaction.response.send_modal(GeneralModal())
 
-    @app_commands.command(name="salary_level100", description="Set hourly passive XP for Level 100+")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def salary_level100(self, interaction: discord.Interaction, hourly_amount: int):
-        await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
-        await bot.db.execute("UPDATE guild_settings SET level100_salary = ? WHERE guild_id = ?", (hourly_amount, interaction.guild.id))
-        await bot.db.commit()
-        await interaction.response.send_message(f"✅ Users Level 100+ will now earn **{hourly_amount} XP** every hour.", ephemeral=True)
+# --- COMMANDS ---
 
-    @app_commands.command(name="ping_channel", description="Where should level up messages go?")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def ping_channel(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
-        cid = channel.id if channel else 0
-        await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
-        await bot.db.execute("UPDATE guild_settings SET level_channel_id = ? WHERE guild_id = ?", (cid, interaction.guild.id))
-        await bot.db.commit()
-        dest = channel.mention if channel else "the channel where they chat"
-        await interaction.response.send_message(f"✅ Level ups will now be sent to {dest}.", ephemeral=True)
-
-    @app_commands.command(name="birthday_channel", description="Where should birthdays be announced?")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def birthday_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
-        await bot.db.execute("UPDATE guild_settings SET birthday_channel_id = ? WHERE guild_id = ?", (channel.id, interaction.guild.id))
-        await bot.db.commit()
-        await interaction.response.send_message(f"✅ Birthdays will be announced in {channel.mention}.", ephemeral=True)
-
-bot.tree.add_command(ConfigGroup())
+@bot.tree.command(name="config", description="Open the Server Configuration Dashboard")
+@app_commands.checks.has_permissions(administrator=True)
+async def config(interaction: discord.Interaction):
+    embed = discord.Embed(title="🎛️ Labworks Control Panel", description="Use the dropdown menu below to configure your server's XP system.", color=discord.Color.gold())
+    embed.add_field(name="🛡️ Roles", value="Set Multipliers, Salaries, Voice XP, & Level Rewards.", inline=True)
+    embed.add_field(name="📢 Channels", value="Set Channel Boosts & Message Routing.", inline=True)
+    embed.add_field(name="⚙️ General", value="Global settings (Lvl 100 Perks).", inline=True)
+    await interaction.response.send_message(embed=embed, view=ConfigDashboard(), ephemeral=True)
 
 # =========================================
 # 👤 PROFILE SETTINGS (Bio, Birthday, etc)
@@ -460,7 +468,8 @@ async def rank(interaction: discord.Interaction):
         cm_data = await c.fetchone()
     if cm_data:
         channel_mult = cm_data[0]
-        boosts_text += f"⚡ **THIS CHANNEL HAS AN ACTIVE BOOSTER [x{channel_mult}]**\n"
+        if channel_mult > 1.0:
+            boosts_text += f"⚡ **THIS CHANNEL HAS AN ACTIVE BOOSTER [x{channel_mult}]**\n"
 
     # Role Boost
     role_mult = 1.0
@@ -536,5 +545,13 @@ class DevGroup(app_commands.Group):
         await interaction.response.send_message(f"🔧 Set {member.mention} to **Rebirth {to_roman(amount)}**.", ephemeral=True)
 
 bot.tree.add_command(DevGroup())
+
+# --- ERROR HANDLER ---
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("🚫 **Access Denied:** This command is reserved for Administrators.", ephemeral=True)
+    else:
+        print(f"Command Error: {error}")
 
 bot.run(os.getenv('DISCORD_TOKEN'))
