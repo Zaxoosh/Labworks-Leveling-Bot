@@ -672,18 +672,40 @@ bot.tree.add_command(ProfileGroup())
 
 @bot.tree.command(name="boost_user", description="Level 150+: Give a 2x XP boost to a friend (1hr)")
 async def boost_user(interaction: discord.Interaction, target: discord.Member):
+    # 1. Prevent Self-Boosting
+    if interaction.user.id == target.id:
+        return await interaction.response.send_message("❌ You cannot boost yourself! Spread the love to a friend.", ephemeral=True)
+
+    # 2. Check DB for Level and Cooldown
     async with bot.db.execute("SELECT level, last_gift_used FROM users WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
         d = await c.fetchone()
-    if not d or d[0] < 150: return await interaction.response.send_message("❌ You must be **Level 150** to use this.", ephemeral=True)
+    
+    if not d or d[0] < 150: 
+        return await interaction.response.send_message("❌ You must be **Level 150** to use this.", ephemeral=True)
+
     last_used = d[1]
     now = time.time()
-    if now - last_used < 86400: return await interaction.response.send_message(f"❌ Cooldown active.", ephemeral=True)
-    end_time = now + 3600
-    await bot.db.execute("INSERT INTO active_boosts (user_id, guild_id, end_time, multiplier) VALUES (?, ?, ?, ?)", (target.id, interaction.guild.id, end_time, 2.0))
+    cooldown = 86400 # 24 hours
+
+    # 3. Calculate Remaining Time
+    if now - last_used < cooldown:
+        remaining = cooldown - (now - last_used)
+        hours = int(remaining // 3600)
+        minutes = int((remaining % 3600) // 60)
+        return await interaction.response.send_message(f"❌ **Cooldown Active:** You can gift again in **{hours}h {minutes}m**.", ephemeral=True)
+
+    # 4. Apply Boost
+    end_time = now + 3600 # 1 hour
+    
+    # Give the boost to the TARGET
+    await bot.db.execute("INSERT OR REPLACE INTO active_boosts (user_id, guild_id, end_time, multiplier) VALUES (?, ?, ?, ?)", (target.id, interaction.guild.id, end_time, 2.0))
+    
+    # Mark the cooldown on the SENDER
     await bot.db.execute("UPDATE users SET last_gift_used = ? WHERE user_id=? AND guild_id=?", (now, interaction.user.id, interaction.guild.id))
     await bot.db.commit()
+    
     await interaction.response.send_message(f"🎁 **GIFT SENT!** {target.mention} now has a **2x XP Boost** for 1 hour!")
-
+    
 @bot.tree.command(name="rank", description="Check your stats or another user's")
 async def rank(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
