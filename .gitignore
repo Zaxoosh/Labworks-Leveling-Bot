@@ -1,3 +1,4 @@
 .env
+levels.db
 __pycache__/
 *.log
