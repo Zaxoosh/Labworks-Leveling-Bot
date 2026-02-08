@@ -62,25 +62,25 @@ The bot uses a fully isolated per-guild architecture and modern slash commands.
 ## Installation
 
 Clone the repository:
-
+```bash
 git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git  
 cd YOUR_REPO_NAME
-
+```
 Install dependencies:
-
+```bash
 pip install -r requirements.txt
-
+```
 Create an environment file in the project root named .env:
-
+```bash
 DISCORD_TOKEN=your_bot_token_here
-
+```
 Database notes:
 - The database file levels.db is created automatically on first run
 
 Run the bot:
-
+```bash
 python main.py
-
+```
 ---
 
 ## Commands
