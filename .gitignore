@@ -12,3 +12,10 @@ __pycache__/
 # Environments
 venv/
 env/
+
+# --- Labworks Data ---
+# Ignore all CSV data exports
+*.csv
+
+# Ignore the local data directory (backups, logs, etc)
+data/
