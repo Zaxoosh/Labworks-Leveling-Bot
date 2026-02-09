@@ -63,8 +63,8 @@ The bot uses a fully isolated per-guild architecture and modern slash commands.
 
 Clone the repository:
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git  
-cd YOUR_REPO_NAME
+git clone https://github.com/Zaxoosh/Labworks-Leveling-Bot.git  
+cd Labworks-Leveling-Bot
 ```
 Install dependencies:
 ```bash

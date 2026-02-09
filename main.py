@@ -129,7 +129,6 @@ class LevelBot(commands.Bot):
         final_xp = int(amount * rebirth_mult * role_mult * temp_mult * global_mult)
         
         # 4. AUDIT: Suspicious Activity Check
-        # If a single message grants > 150 XP (High value for standard chatting), flag it.
         if final_xp > 150 and audit_id != 0:
             audit_chan = member.guild.get_channel(audit_id)
             if audit_chan:
@@ -285,30 +284,28 @@ async def on_message(message):
 
     await bot.db.execute("UPDATE users SET next_xp_time=? WHERE user_id=? AND guild_id=?", (current_time + random.randint(15, 30), message.author.id, message.guild.id))
     await bot.db.commit()
+    await bot.process_commands(message)
 
 # =========================================
 # 🎛️ DEV MENU & DASHBOARDS
 # =========================================
 
-# --- MODALS FOR DEV ACTIONS ---
 class DevValueModal(ui.Modal, title="Update Player Stats"):
     amount = ui.TextInput(label="Enter Amount", placeholder="10")
     def __init__(self, target_user, mode):
         super().__init__()
         self.target_user = target_user
-        self.mode = mode # "level" or "rebirth"
+        self.mode = mode 
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             val = int(self.amount.value)
             col = "level" if self.mode == "level" else "rebirth"
             await bot.db.execute(f"INSERT OR IGNORE INTO users (user_id, guild_id) VALUES (?, ?)", (self.target_user.id, interaction.guild.id))
-            # Reset XP if setting level to avoid math bugs
             extra_sql = ", xp=0" if self.mode == "level" else ""
             await bot.db.execute(f"UPDATE users SET {col} = ?{extra_sql} WHERE user_id = ? AND guild_id = ?", (val, self.target_user.id, interaction.guild.id))
             await bot.db.commit()
             
-            # Audit Log Check
             async with bot.db.execute("SELECT audit_channel_id FROM guild_settings WHERE guild_id=?", (interaction.guild.id,)) as c:
                 d = await c.fetchone()
             if d and d[0] != 0:
@@ -330,10 +327,8 @@ class GlobalEventModal(ui.Modal, title="Global XP Event"):
             
             msg = f"🌍 **GLOBAL EVENT ACTIVATED!** XP is now **x{val}**!" if val > 1.0 else "🌍 Global Event Ended. XP is normal."
             await interaction.response.send_message(msg, ephemeral=True)
-            if val > 1.0: await interaction.channel.send(msg) # Announce to channel too
+            if val > 1.0: await interaction.channel.send(msg)
         except: await interaction.response.send_message("❌ Invalid number.", ephemeral=True)
-
-# --- VIEWS FOR DEV MENU ---
 
 class AuditChannelSelect(ui.ChannelSelect):
     def __init__(self):
@@ -454,7 +449,6 @@ async def leaderboard(interaction: discord.Interaction):
 # =========================================
 # 🎛️ CONFIG DASHBOARD
 # =========================================
-# (Standard Config Logic - Roles, Channels, Sponsors)
 
 class MultiplierModal(ui.Modal, title="XP Multiplier"):
     amount = ui.TextInput(label="Multiplier", placeholder="1.5")
@@ -584,11 +578,15 @@ class ConfigSelect(ui.Select):
         options = [
             discord.SelectOption(label="Manage Roles", description="Multipliers, Salaries", emoji="🛡️", value="roles"),
             discord.SelectOption(label="Manage Channels", description="Boosts, Routing", emoji="📢", value="channels"),
-            discord.SelectOption(label="Sponsors", description="Add/Remove Sponsors", emoji="💎", value="general")
+            discord.SelectOption(label="Sponsors", description="Add/Remove Sponsors", emoji="💎", value="general"),
+            discord.SelectOption(label="View Level Roles", description="List all level-up rewards", emoji="📜", value="view_level_roles")
         ]
         super().__init__(placeholder="Config Category...", min_values=1, max_values=1, options=options)
+
     async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "roles":
+        val = self.values[0]
+        
+        if val == "roles":
             view = ui.View()
             role_select = ui.RoleSelect(placeholder="Pick a role...")
             async def role_callback(inter):
@@ -596,7 +594,8 @@ class ConfigSelect(ui.Select):
             role_select.callback = role_callback
             view.add_item(role_select)
             await interaction.response.send_message(embed=discord.Embed(title="🛡️ Roles", color=discord.Color.blue()), view=view, ephemeral=True)
-        elif self.values[0] == "channels":
+            
+        elif val == "channels":
             view = ui.View()
             chan_select = ui.ChannelSelect(channel_types=[discord.ChannelType.text, discord.ChannelType.voice], placeholder="Pick a channel...")
             async def chan_callback(inter):
@@ -604,8 +603,28 @@ class ConfigSelect(ui.Select):
             chan_select.callback = chan_callback
             view.add_item(chan_select)
             await interaction.response.send_message(embed=discord.Embed(title="📢 Channels", color=discord.Color.green()), view=view, ephemeral=True)
-        elif self.values[0] == "general":
+            
+        elif val == "general":
             await interaction.response.send_message(embed=discord.Embed(title="💎 Sponsors", color=discord.Color.gold()), view=SponsorSettingsView(), ephemeral=True)
+            
+        elif val == "view_level_roles":
+            # 1. Fetch data
+            async with bot.db.execute("SELECT level, role_id FROM level_roles WHERE guild_id = ? ORDER BY level DESC", (interaction.guild.id,)) as c:
+                rows = await c.fetchall()
+            
+            # 2. Build List
+            embed = discord.Embed(title="📜 Current Level Roles", color=discord.Color.teal())
+            if not rows:
+                embed.description = "❌ No level roles configured yet.\nGo to **Manage Roles** -> Pick a Role -> **Assign to Level**."
+            else:
+                lines = []
+                for level, role_id in rows:
+                    role = interaction.guild.get_role(role_id)
+                    role_str = role.mention if role else f"`Deleted Role ({role_id})`"
+                    lines.append(f"**Level {level}:** {role_str}")
+                embed.description = "\n".join(lines)
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="config", description="Open the Server Configuration Dashboard")
 @app_commands.checks.has_permissions(administrator=True)
@@ -738,9 +757,9 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
     channel_mult = 1.0
     async with bot.db.execute("SELECT multiplier FROM channel_multipliers WHERE channel_id=?", (interaction.channel.id,)) as c:
         cm_data = await c.fetchone()
-    if cm_data and cm_data[0] > 1.0:
-        channel_mult = cm_data[0]
-        boosts_text += f"⚡ **Channel Boost**: x{channel_mult}\n"
+        if cm_data and cm_data[0] > 1.0:
+            channel_mult = cm_data[0]
+            boosts_text += f"⚡ **Channel Boost**: x{channel_mult}\n"
 
     # C. Role Boost
     role_mult = 1.0
@@ -811,4 +830,148 @@ async def on_app_command_error(i: discord.Interaction, e: app_commands.AppComman
     if isinstance(e, app_commands.MissingPermissions): await i.response.send_message("🚫 Admin Only.", ephemeral=True)
     else: print(f"Error: {e}")
 
+@bot.command()
+@commands.is_owner()
+async def sync(ctx):
+    # This copies the global commands to the server where you typed !sync
+    bot.tree.copy_global_to(guild=ctx.guild)
+    synced = await bot.tree.sync(guild=ctx.guild)
+    await ctx.send(f"✅ **Synced {len(synced)} commands to {ctx.guild.name}!**")
+
+@bot.tree.command(name="sync_roles", description="Fix missing roles for a user or the whole server (Admin Only)")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(target="Leave empty to sync EVERYONE (might take a while)")
+async def sync_roles(interaction: discord.Interaction, target: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+    
+    # 1. Fetch all Level Roles for this server
+    async with bot.db.execute("SELECT level, role_id FROM level_roles WHERE guild_id = ? ORDER BY level DESC", (interaction.guild.id,)) as c:
+        role_data = await c.fetchall()
+    
+    if not role_data:
+        return await interaction.followup.send("❌ No level roles are configured yet!")
+
+    # Format: [(Level, RoleID), (Level, RoleID)...] sorted highest to lowest
+    all_role_ids = {r[1] for r in role_data}
+
+    # 2. Define the Sync Logic
+    async def sync_user(member):
+        # Fetch user's level
+        async with bot.db.execute("SELECT level FROM users WHERE user_id=? AND guild_id=?", (member.id, interaction.guild.id)) as c:
+            d = await c.fetchone()
+        
+        # If user isn't in DB, skip
+        if not d: return False 
+        
+        user_level = d[0]
+        correct_role_id = None
+        
+        # Find the highest role they are eligible for
+        for lvl, r_id in role_data:
+            if user_level >= lvl:
+                correct_role_id = r_id
+                break # Stop at the highest one
+        
+        # If no role matches (e.g. Level 1), correct_role_id remains None
+        
+        roles_to_add = []
+        roles_to_remove = []
+        
+        user_role_ids = [r.id for r in member.roles]
+
+        # Calculate Add/Remove
+        if correct_role_id and correct_role_id not in user_role_ids:
+            r = member.guild.get_role(correct_role_id)
+            if r: roles_to_add.append(r)
+            
+        for r_id in all_role_ids:
+            if r_id in user_role_ids and r_id != correct_role_id:
+                r = member.guild.get_role(r_id)
+                if r: roles_to_remove.append(r)
+        
+        # Apply Changes
+        if roles_to_add or roles_to_remove:
+            try:
+                if roles_to_remove: await member.remove_roles(*roles_to_remove)
+                if roles_to_add: await member.add_roles(*roles_to_add)
+                return True
+            except:
+                return False
+        return False
+
+    # 3. Execution
+    if target:
+        # Sync SINGLE user
+        modified = await sync_user(target)
+        if modified:
+            await interaction.followup.send(f"✅ **Synced:** {target.mention} roles have been updated.")
+        else:
+            await interaction.followup.send(f"👍 **Up to Date:** {target.mention} already has the correct roles.")
+    else:
+        # Sync EVERYONE
+        await interaction.followup.send("🔄 **Syncing Server...** This may take a moment.")
+        count = 0
+        for member in interaction.guild.members:
+            if member.bot: continue
+            if await sync_user(member):
+                count += 1
+                # Small sleep to prevent rate limits if updating hundreds of people
+                await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=0.5))
+        
+        await interaction.followup.send(f"✅ **Complete:** Updated roles for **{count}** users.")
+
+@bot.tree.command(name="debug_rank", description="Analyze exactly why a user isn't getting a role")
+@app_commands.checks.has_permissions(administrator=True)
+async def debug_rank(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    # 1. Get User Data
+    async with bot.db.execute("SELECT level, xp FROM users WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
+        u_data = await c.fetchone()
+    
+    if not u_data:
+        return await interaction.followup.send("❌ User not found in database.")
+    
+    u_level = u_data[0]
+    
+    # 2. Get All Roles
+    async with bot.db.execute("SELECT level, role_id FROM level_roles WHERE guild_id=? ORDER BY level DESC", (interaction.guild.id,)) as c:
+        roles = await c.fetchall()
+
+    log = [f"🔍 **Analysis for {target.mention}**"]
+    log.append(f"• **DB Level:** `{u_level}` (Type: {type(u_level).__name__})")
+    log.append(f"• **User Roles:** {[r.name for r in target.roles]}")
+    log.append("--- **Logic Trace** ---")
+
+    best_match = None
+
+    # 3. Simulate the Loop
+    for lvl, r_id in roles:
+        role_obj = interaction.guild.get_role(r_id)
+        role_name = role_obj.name if role_obj else "⚠️ DELETED ROLE"
+        
+        # Check comparison
+        is_high_enough = u_level >= lvl
+        marker = "✅" if is_high_enough else "❌"
+        
+        log.append(f"{marker} **Lvl {lvl}** ({role_name}) -> User is {u_level}")
+        
+        if is_high_enough and best_match is None:
+            best_match = r_id
+            log.append(f"   🎉 **MATCH FOUND!** Bot selected: {role_name}")
+            
+            # 4. Check Hierarchy / Permissions
+            if role_obj:
+                bot_member = interaction.guild.get_member(bot.user.id)
+                if role_obj.position >= bot_member.top_role.position:
+                    log.append(f"   ⛔ **CRITICAL ERROR:** Bot role is BELOW {role_name}. Cannot assign.")
+                elif role_obj in target.roles:
+                    log.append(f"   ℹ️ User already has this role. No action needed.")
+                else:
+                    log.append(f"   ✨ User needs this role. 'Up to date' message is WRONG.")
+            else:
+                log.append(f"   ⚠️ Role ID {r_id} does not exist in Discord.")
+
+    await interaction.followup.send("\n".join(log))
+    
 bot.run(os.getenv('DISCORD_TOKEN'))
