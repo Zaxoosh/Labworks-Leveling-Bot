@@ -85,26 +85,49 @@ python main.py
 
 ## Commands
 
-### User Commands
-- /rank – View your level, XP progress, and active boosts
-- /rebirth – Reset to Level 1 for a permanent XP multiplier (Level 200 and above)
-- /profile bio – Set a profile bio (Level 20 and above)
-- /profile levelup_msg – Customize your level-up message (Level 20 and above)
-- /profile birthday – Set your birthday (Level 50 and above)
-- /boost_user – Gift a 2x XP boost to another user (Level 150 and above)
+Here is the updated **Commands** section for your `README.md` in Markdown format. You can copy and paste this directly.
 
-### Admin and Configuration Commands (/config)
-- set_multiplier – Assign XP multipliers to roles
-- set_channel_boost – Assign XP multipliers to channels
-- level_role – Configure level-based roles using replace mode
-- salary_role – Set hourly XP salary for roles
-- salary_level100 – Configure Level 100 and above passive salary
-- ping_channel – Set the level-up announcement channel
-- view – View the current server configuration
+---
 
-### Developer Commands (/dev)
-- set_level – Force set a user’s level
-- set_rebirth – Force set a user’s rebirth count
+### 🎮 Commands
+
+#### **Public Commands**
+
+| Command | Description | Requirement |
+| --- | --- | --- |
+| `/rank` | View your current Level, XP, Rebirth status, and active multipliers. | None |
+| `/leaderboard` | View top players (All-Time, Monthly, Weekly, or Message count). | None |
+| `/sponsors` | View the legendary supporters of the Labworks studio. | None |
+| `/profile bio` | Set a custom bio for your rank card. | Level 20+ |
+| `/profile levelup_msg` | Set a custom message that triggers when you level up. | Level 20+ |
+| `/profile birthday` | Set your birthday (DD-MM) for server-wide celebrations. | Level 50+ |
+| `/boost_user` | Gift a 1-hour 2x XP boost to a friend (24h Cooldown). | Level 150+ |
+| `/rebirth` | Reset to Level 1 for a permanent **x1.2 XP boost** and prestige tag. | Level 200 |
+
+#### **Admin & Developer Commands**
+
+| Command | Description |
+| --- | --- |
+| `/config` | **Labworks Control Panel**: Manage role salaries, XP multipliers, and channel routing. |
+| `/dev` | **Control Center**: Force set player levels/rebirths and manage Global XP Events. |
+| `/sync_roles` | Force syncs user roles based on their current level (fixes skipped roles). |
+| `/debug_rank` | Analyze exactly why a specific user is or isn't receiving a level role. |
+| `!sync` | (Owner Only) Instantly syncs Slash Commands to the current guild. |
+| `!clearglobals` | (Owner Only) Wipes all global slash commands for troubleshooting. |
+
+---
+
+### ⚙️ Setup & Configuration
+
+To get the bot fully operational after installation:
+
+1. **Role Mapping:** Use `/config` -> **Manage Roles** -> **Assign to Level** to link your Discord roles to the leveling system.
+2. **Channel Routing:** Use `/config` -> **Manage Channels** -> **Route Level Ups** to keep general chat clean.
+3. **Security:** Use `/dev` -> **Security & Audit** to set a staff-only channel for logging suspicious XP gains (e.g., >150 XP per message).
+
+---
+
+**Would you like me to generate a "Contribution Guidelines" section next to explain how to submit Pull Requests for new features?**
 
 ---
 
