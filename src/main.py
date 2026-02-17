@@ -8,7 +8,7 @@ import time
 import datetime
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=False)
 
 TEST_GUILD_ID = 1041046184552308776
 TEST_GUILD = discord.Object(id=TEST_GUILD_ID)
@@ -19,7 +19,7 @@ def to_roman(num):
     syb = ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"]
     roman_num = ''
     i = 0
-    while  num > 0:
+    while num > 0:
         for _ in range(num // val[i]):
             roman_num += syb[i]
             num -= val[i]
@@ -36,8 +36,8 @@ class LevelBot(commands.Bot):
         super().__init__(command_prefix='!', intents=intents)
         
     async def setup_hook(self):
-        self.db = await aiosqlite.connect("levels.db")
-        
+        # FIXED: Removed the /data/ prefix so it finds the DB in the same folder as main.py
+        self.db = await aiosqlite.connect("/data/levels.db")        
         # TABLES
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -57,7 +57,6 @@ class LevelBot(commands.Bot):
                 PRIMARY KEY (user_id, guild_id)
             )
         """)
-        # Added global_xp_mult and audit_channel_id
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY, 
@@ -78,10 +77,11 @@ class LevelBot(commands.Bot):
         
         await self.db.commit()
         
-        self.loop.create_task(self.voice_xp_loop())
-        self.loop.create_task(self.presence_xp_loop())
-        self.loop.create_task(self.birthday_loop())
-        self.loop.create_task(self.reset_stats_loop())
+        # FIXED: Starting the optimized @tasks.loop handlers
+        self.voice_xp_loop.start()
+        self.presence_xp_loop.start()
+        self.birthday_loop.start()
+        self.reset_stats_loop.start()
 
         self.tree.copy_global_to(guild=TEST_GUILD)
         await self.tree.sync(guild=TEST_GUILD)
@@ -106,11 +106,9 @@ class LevelBot(commands.Bot):
         current_xp, current_level, current_rebirth, custom_msg = data
         
         # 2. Fetch Multipliers
-        # A. Rebirth
         rebirth_mult = 1.0 + (current_rebirth * 0.2)
-        # B. Role
         role_mult = await calculate_multiplier(member)
-        # C. Temp Boosts
+        
         temp_mult = 1.0
         now = time.time()
         await self.db.execute("DELETE FROM active_boosts WHERE end_time < ?", (now,))
@@ -118,7 +116,7 @@ class LevelBot(commands.Bot):
         async with self.db.execute("SELECT multiplier FROM active_boosts WHERE user_id=? AND guild_id=?", (member.id, member.guild.id)) as c:
             boost_data = await c.fetchone()
             if boost_data: temp_mult = boost_data[0]
-        # D. Global Event Multiplier
+            
         global_mult = 1.0
         async with self.db.execute("SELECT global_xp_mult, audit_channel_id FROM guild_settings WHERE guild_id=?", (member.guild.id,)) as c:
             g_data = await c.fetchone()
@@ -148,13 +146,20 @@ class LevelBot(commands.Bot):
             xp_needed = 5 * (current_level ** 2) + (50 * current_level) + 100
             did_level_up = True
 
-        # 6. Role Swapping
+        # 6. Role Swapping (FIXED: Now finds the highest eligible role instead of exact match)
         if did_level_up:
             async with self.db.execute("SELECT level, role_id FROM level_roles WHERE guild_id = ?", (member.guild.id,)) as c:
                 all_level_roles = await c.fetchall()
             level_map = {row[0]: row[1] for row in all_level_roles}
-            if current_level in level_map:
-                new_role_id = level_map[current_level]
+            
+            eligible_role_id = None
+            for lvl in sorted(level_map.keys(), reverse=True):
+                if current_level >= lvl:
+                    eligible_role_id = level_map[lvl]
+                    break
+
+            if eligible_role_id:
+                new_role_id = eligible_role_id
                 new_role = member.guild.get_role(new_role_id)
                 roles_to_remove = []
                 all_ids = set(level_map.values())
@@ -176,69 +181,72 @@ class LevelBot(commands.Bot):
         await self.db.commit()
         return did_level_up, current_level, custom_msg
 
-    # --- LOOPS ---
+    # --- OPTIMIZED LOOPS ---
+    @tasks.loop(minutes=1)
     async def voice_xp_loop(self):
-        await self.wait_until_ready()
-        while not self.is_closed():
-            await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(minutes=1))
-            async with self.db.execute("SELECT role_id FROM voice_roles") as cursor:
-                voice_ids = {row[0] for row in await cursor.fetchall()}
-            for guild in self.guilds:
-                for member in guild.members:
-                    if member.voice and not member.voice.self_deaf and not member.bot:
-                        if any(r.id in voice_ids for r in member.roles):
-                            await self.add_xp(member, 7)
+        async with self.db.execute("SELECT role_id FROM voice_roles") as cursor:
+            voice_ids = {row[0] for row in await cursor.fetchall()}
+        for guild in self.guilds:
+            for member in guild.members:
+                if member.voice and not member.voice.self_deaf and not member.bot:
+                    if any(r.id in voice_ids for r in member.roles):
+                        await self.add_xp(member, 7)
+                        
+    @voice_xp_loop.before_loop
+    async def before_voice_xp(self): await self.wait_until_ready()
 
+    @tasks.loop(hours=1)
     async def presence_xp_loop(self):
-        await self.wait_until_ready()
-        while not self.is_closed():
-            await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(hours=1))
-            async with self.db.execute("SELECT role_id, amount FROM presence_roles") as cursor:
-                salaries = {row[0]: row[1] for row in await cursor.fetchall()}
-            
-            async with self.db.execute("SELECT guild_id, level100_salary FROM guild_settings") as cursor:
-                lvl100_salaries = {row[0]: row[1] for row in await cursor.fetchall()}
+        async with self.db.execute("SELECT role_id, amount FROM presence_roles") as cursor:
+            salaries = {row[0]: row[1] for row in await cursor.fetchall()}
+        async with self.db.execute("SELECT guild_id, level100_salary FROM guild_settings") as cursor:
+            lvl100_salaries = {row[0]: row[1] for row in await cursor.fetchall()}
 
-            for guild in self.guilds:
-                lvl100_amount = lvl100_salaries.get(guild.id, 0)
-                for member in guild.members:
-                    if member.bot: continue
-                    total = sum(salaries[r.id] for r in member.roles if r.id in salaries)
-                    if lvl100_amount > 0:
-                        async with self.db.execute("SELECT level FROM users WHERE user_id=? AND guild_id=?", (member.id, guild.id)) as c:
-                            ud = await c.fetchone()
-                            if ud and ud[0] >= 100: total += lvl100_amount
-                    if total > 0: await self.add_xp(member, total)
+        for guild in self.guilds:
+            lvl100_amount = lvl100_salaries.get(guild.id, 0)
+            for member in guild.members:
+                if member.bot: continue
+                total = sum(salaries[r.id] for r in member.roles if r.id in salaries)
+                if lvl100_amount > 0:
+                    async with self.db.execute("SELECT level FROM users WHERE user_id=? AND guild_id=?", (member.id, guild.id)) as c:
+                        ud = await c.fetchone()
+                        if ud and ud[0] >= 100: total += lvl100_amount
+                if total > 0: await self.add_xp(member, total)
 
+    @presence_xp_loop.before_loop
+    async def before_presence_xp(self): await self.wait_until_ready()
+
+    # Fires exactly at 00:00 UTC Daily
+    @tasks.loop(time=datetime.time(hour=0, minute=0, tzinfo=datetime.timezone.utc))
     async def birthday_loop(self):
-        await self.wait_until_ready()
-        while not self.is_closed():
-            now = datetime.datetime.now()
-            today_str = now.strftime("%d-%m")
-            async with self.db.execute("SELECT user_id, guild_id FROM users WHERE birthday = ?", (today_str,)) as cursor:
-                birthdays = await cursor.fetchall()
-            for user_id, guild_id in birthdays:
-                guild = self.get_guild(guild_id)
-                if not guild: continue
-                async with self.db.execute("SELECT birthday_channel_id FROM guild_settings WHERE guild_id=?", (guild_id,)) as c:
-                    s = await c.fetchone()
-                if s and s[0] != 0:
-                    channel = guild.get_channel(s[0])
-                    if channel: await channel.send(f"🎂 Happy Birthday <@{user_id}>! Hope you have a fantastic day! 🎉")
-            await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(days=1))
+        now = datetime.datetime.utcnow()
+        today_str = now.strftime("%d-%m")
+        async with self.db.execute("SELECT user_id, guild_id FROM users WHERE birthday = ?", (today_str,)) as cursor:
+            birthdays = await cursor.fetchall()
+        for user_id, guild_id in birthdays:
+            guild = self.get_guild(guild_id)
+            if not guild: continue
+            async with self.db.execute("SELECT birthday_channel_id FROM guild_settings WHERE guild_id=?", (guild_id,)) as c:
+                s = await c.fetchone()
+            if s and s[0] != 0:
+                channel = guild.get_channel(s[0])
+                if channel: await channel.send(f"🎂 Happy Birthday <@{user_id}>! Hope you have a fantastic day! 🎉")
 
-    # RESET LOOP
+    @birthday_loop.before_loop
+    async def before_birthday(self): await self.wait_until_ready()
+
+    # Fires exactly at 00:00 UTC Daily
+    @tasks.loop(time=datetime.time(hour=0, minute=0, tzinfo=datetime.timezone.utc))
     async def reset_stats_loop(self):
-        await self.wait_until_ready()
-        while not self.is_closed():
-            now = datetime.datetime.utcnow()
-            if now.day == 1 and now.hour == 0 and now.minute < 5:
-                await self.db.execute("UPDATE users SET monthly_xp = 0")
-                await self.db.commit()
-            if now.weekday() == 0 and now.hour == 0 and now.minute < 5:
-                await self.db.execute("UPDATE users SET weekly_xp = 0")
-                await self.db.commit()
-            await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(hours=1))
+        now = datetime.datetime.utcnow()
+        if now.day == 1:
+            await self.db.execute("UPDATE users SET monthly_xp = 0")
+        if now.weekday() == 0:
+            await self.db.execute("UPDATE users SET weekly_xp = 0")
+        await self.db.commit()
+
+    @reset_stats_loop.before_loop
+    async def before_reset_stats(self): await self.wait_until_ready()
 
 bot = LevelBot()
 
@@ -392,7 +400,7 @@ async def dev(interaction: discord.Interaction):
 # 🏆 LEADERBOARD SYSTEM
 # =========================================
 
-class LeaderboardSelect(ui.Select):
+class LeaderboardSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(label="All-Time XP", value="xp", emoji="🏆", description="Total Experience gained forever."),
@@ -400,51 +408,95 @@ class LeaderboardSelect(ui.Select):
             discord.SelectOption(label="Weekly XP", value="weekly_xp", emoji="⏳", description="Experience gained this week."),
             discord.SelectOption(label="Messages", value="message_count", emoji="💬", description="Total chat messages sent.")
         ]
-        super().__init__(placeholder="Filter Leaderboard...", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="Filter Leaderboard...", min_values=1, max_values=1, options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
-        sort_col = self.values[0]
+        self.view.sort_col = self.values[0]
+        self.view.page = 0
+        await self.view.update_view(interaction)
+
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self, interaction: discord.Interaction):
+        super().__init__(timeout=180) 
+        self.interaction = interaction
+        self.page = 0
+        self.sort_col = "xp" 
+        self.add_item(LeaderboardSelect()) 
+
+    async def generate_embed(self):
+        offset = self.page * 10
+        
         titles = {
             "xp": "🏆 All-Time XP Leaderboard",
             "monthly_xp": "📅 Monthly XP Leaderboard",
             "weekly_xp": "⏳ Weekly XP Leaderboard",
             "message_count": "💬 Top Chatters (Message Count)"
         }
-        async with bot.db.execute(f"SELECT user_id, {sort_col}, level, rebirth FROM users WHERE guild_id = ? ORDER BY {sort_col} DESC LIMIT 10", (interaction.guild.id,)) as c:
+        
+        if self.sort_col == "xp":
+            order_clause = "CAST(level AS INTEGER) DESC, CAST(xp AS INTEGER) DESC"
+        else:
+            order_clause = f"CAST({self.sort_col} AS INTEGER) DESC"
+
+        query = f"""
+            SELECT user_id, {self.sort_col}, level, rebirth 
+            FROM users 
+            WHERE guild_id = ? 
+            ORDER BY {order_clause} 
+            LIMIT 10 OFFSET ?
+        """
+        
+        async with bot.db.execute(query, (self.interaction.guild.id, offset)) as c:
             rows = await c.fetchall()
-        embed = discord.Embed(title=titles[sort_col], color=discord.Color.gold())
-        if not rows: embed.description = "No data found yet! Start chatting."
+
+        embed = discord.Embed(title=titles[self.sort_col], color=discord.Color.gold())
+        
+        if not rows and self.page == 0:
+            embed.description = "No data found yet! Start chatting."
+            self.next_button.disabled = True
+        elif not rows:
+            embed.description = "No more users found on this page."
+            self.next_button.disabled = True
         else:
             desc = ""
-            for index, row in enumerate(rows, 1):
+            for index, row in enumerate(rows):
+                rank = (self.page * 10) + index + 1
                 uid, val, lvl, rebirth = row
-                rebirth_str = f" [Rb {to_roman(rebirth)}]" if rebirth > 0 else ""
-                stat_str = f"**{val:,}** msgs" if sort_col == "message_count" else f"**{val:,}** XP"
-                desc += f"`#{index}` <@{uid}>{rebirth_str} • Lvl {lvl} • {stat_str}\n"
+                
+                val = int(val) if val else 0
+                rebirth_str = f" [Rb {to_roman(rebirth)}]" if rebirth and int(rebirth) > 0 else ""
+                stat_str = f"**{val:,}** msgs" if self.sort_col == "message_count" else f"**{val:,}** XP"
+                
+                desc += f"`#{rank}` <@{uid}>{rebirth_str} • Lvl {lvl} • {stat_str}\n"
+            
             embed.description = desc
-        embed.set_footer(text="Implemented on 08/02/2026. All tracking for messages started after that.")
-        await interaction.response.edit_message(embed=embed, view=self.view)
+            self.next_button.disabled = len(rows) < 10
 
-class LeaderboardView(ui.View):
-    def __init__(self):
-        super().__init__()
-        self.add_item(LeaderboardSelect())
+        embed.set_footer(text=f"Page {self.page + 1} • Implemented on 08/02/2026. All tracking for messages started after that.")
+        return embed
+
+    async def update_view(self, interaction: discord.Interaction):
+        self.prev_button.disabled = self.page == 0
+        embed = await self.generate_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.blurple, disabled=True, row=1)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await self.update_view(interaction)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.blurple, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await self.update_view(interaction)
+
 
 @bot.tree.command(name="leaderboard", description="View the server leaderboards")
 async def leaderboard(interaction: discord.Interaction):
-    async with bot.db.execute("SELECT user_id, xp, level, rebirth FROM users WHERE guild_id = ? ORDER BY xp DESC LIMIT 10", (interaction.guild.id,)) as c:
-        rows = await c.fetchall()
-    embed = discord.Embed(title="🏆 All-Time XP Leaderboard", color=discord.Color.gold())
-    if not rows: embed.description = "No data found yet! Start chatting."
-    else:
-        desc = ""
-        for index, row in enumerate(rows, 1):
-            uid, val, lvl, rebirth = row
-            rebirth_str = f" [Rb {to_roman(rebirth)}]" if rebirth > 0 else ""
-            desc += f"`#{index}` <@{uid}>{rebirth_str} • Lvl {lvl} • **{val:,}** XP\n"
-        embed.description = desc
-    embed.set_footer(text="Implemented on 08/02/2026. All tracking for messages started after that.")
-    await interaction.response.send_message(embed=embed, view=LeaderboardView())
+    view = LeaderboardView(interaction)
+    embed = await view.generate_embed()
+    await interaction.response.send_message(embed=embed, view=view)
 
 # =========================================
 # 🎛️ CONFIG DASHBOARD
@@ -579,7 +631,7 @@ class ConfigSelect(ui.Select):
             discord.SelectOption(label="Manage Roles", description="Multipliers, Salaries", emoji="🛡️", value="roles"),
             discord.SelectOption(label="Manage Channels", description="Boosts, Routing", emoji="📢", value="channels"),
             discord.SelectOption(label="Sponsors", description="Add/Remove Sponsors", emoji="💎", value="general"),
-            discord.SelectOption(label="View Level Roles", description="List all level-up rewards", emoji="📜", value="view_level_roles")
+            discord.SelectOption(label="View Role Stats", description="List levels, multipliers, and salaries", emoji="📊", value="view_role_stats")
         ]
         super().__init__(placeholder="Config Category...", min_values=1, max_values=1, options=options)
 
@@ -607,21 +659,39 @@ class ConfigSelect(ui.Select):
         elif val == "general":
             await interaction.response.send_message(embed=discord.Embed(title="💎 Sponsors", color=discord.Color.gold()), view=SponsorSettingsView(), ephemeral=True)
             
-        elif val == "view_level_roles":
-            # 1. Fetch data
-            async with bot.db.execute("SELECT level, role_id FROM level_roles WHERE guild_id = ? ORDER BY level DESC", (interaction.guild.id,)) as c:
-                rows = await c.fetchall()
+        elif val == "view_role_stats":
+            async with bot.db.execute("SELECT role_id, level FROM level_roles WHERE guild_id = ?", (interaction.guild.id,)) as c:
+                level_data = {row[0]: row[1] for row in await c.fetchall()}
             
-            # 2. Build List
-            embed = discord.Embed(title="📜 Current Level Roles", color=discord.Color.teal())
-            if not rows:
-                embed.description = "❌ No level roles configured yet.\nGo to **Manage Roles** -> Pick a Role -> **Assign to Level**."
+            async with bot.db.execute("SELECT role_id, multiplier FROM role_multipliers WHERE guild_id = ?", (interaction.guild.id,)) as c:
+                mult_data = {row[0]: row[1] for row in await c.fetchall()}
+
+            # ✅ FIXED: Changed 'role_salaries' to 'presence_roles'
+            async with bot.db.execute("SELECT role_id, amount FROM presence_roles WHERE guild_id = ?", (interaction.guild.id,)) as c:
+                sal_data = {row[0]: row[1] for row in await c.fetchall()}
+
+            all_role_ids = set(list(level_data.keys()) + list(mult_data.keys()) + list(sal_data.keys()))
+
+            embed = discord.Embed(title="📊 Server Role Stats", description="Here are the active perks for each role:", color=discord.Color.teal())
+            
+            if not all_role_ids:
+                embed.description = "❌ No roles are currently configured in the database."
             else:
                 lines = []
-                for level, role_id in rows:
-                    role = interaction.guild.get_role(role_id)
-                    role_str = role.mention if role else f"`Deleted Role ({role_id})`"
-                    lines.append(f"**Level {level}:** {role_str}")
+                for r_id in all_role_ids:
+                    role = interaction.guild.get_role(r_id)
+                    role_str = role.mention if role else f"`Deleted Role ({r_id})`"
+                    
+                    stats = []
+                    if r_id in level_data:
+                        stats.append(f"**Lvl:** {level_data[r_id]}")
+                    if r_id in mult_data:
+                        stats.append(f"**Mult:** {mult_data[r_id]}x")
+                    if r_id in sal_data:
+                        stats.append(f"**Salary:** {sal_data[r_id]} XP/hr")
+                    
+                    lines.append(f"{role_str} ➜ " + " | ".join(stats))
+                
                 embed.description = "\n".join(lines)
             
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -691,11 +761,9 @@ bot.tree.add_command(ProfileGroup())
 
 @bot.tree.command(name="boost_user", description="Level 150+: Give a 2x XP boost to a friend (1hr)")
 async def boost_user(interaction: discord.Interaction, target: discord.Member):
-    # 1. Prevent Self-Boosting
     if interaction.user.id == target.id:
         return await interaction.response.send_message("❌ You cannot boost yourself! Spread the love to a friend.", ephemeral=True)
 
-    # 2. Check DB for Level and Cooldown
     async with bot.db.execute("SELECT level, last_gift_used FROM users WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
         d = await c.fetchone()
     
@@ -706,30 +774,22 @@ async def boost_user(interaction: discord.Interaction, target: discord.Member):
     now = time.time()
     cooldown = 86400 # 24 hours
 
-    # 3. Calculate Remaining Time
     if now - last_used < cooldown:
         remaining = cooldown - (now - last_used)
         hours = int(remaining // 3600)
         minutes = int((remaining % 3600) // 60)
         return await interaction.response.send_message(f"❌ **Cooldown Active:** You can gift again in **{hours}h {minutes}m**.", ephemeral=True)
 
-    # 4. Apply Boost
     end_time = now + 3600 # 1 hour
-    
-    # Give the boost to the TARGET
     await bot.db.execute("INSERT OR REPLACE INTO active_boosts (user_id, guild_id, end_time, multiplier) VALUES (?, ?, ?, ?)", (target.id, interaction.guild.id, end_time, 2.0))
-    
-    # Mark the cooldown on the SENDER
     await bot.db.execute("UPDATE users SET last_gift_used = ? WHERE user_id=? AND guild_id=?", (now, interaction.user.id, interaction.guild.id))
     await bot.db.commit()
-    
     await interaction.response.send_message(f"🎁 **GIFT SENT!** {target.mention} now has a **2x XP Boost** for 1 hour!")
     
 @bot.tree.command(name="rank", description="Check your stats or another user's")
 async def rank(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
     
-    # 1. Fetch Basic Data
     async with bot.db.execute("SELECT xp, level, rebirth, bio FROM users WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
         data = await c.fetchone()
     async with bot.db.execute("SELECT tier_name FROM sponsors WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
@@ -737,15 +797,12 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
     
     xp, level, rebirth, bio = data if data else (0, 1, 0, "No bio set.")
     
-    # 2. Calculate Progress
     xp_needed = 5 * (level ** 2) + (50 * level) + 100
     percent = min(100, max(0, (xp / xp_needed) * 100))
     bar = "🟦" * int(percent / 10) + "⬜" * (10 - int(percent / 10))
     
-    # 3. CALCULATE MULTIPLIERS (The Missing Part)
     boosts_text = ""
     
-    # A. Global Event
     global_mult = 1.0
     async with bot.db.execute("SELECT global_xp_mult FROM guild_settings WHERE guild_id=?", (interaction.guild.id,)) as c:
         g_data = await c.fetchone()
@@ -753,7 +810,6 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
             global_mult = g_data[0]
             boosts_text += f"🌍 **Global Event**: x{global_mult}\n"
 
-    # B. Channel Boost
     channel_mult = 1.0
     async with bot.db.execute("SELECT multiplier FROM channel_multipliers WHERE channel_id=?", (interaction.channel.id,)) as c:
         cm_data = await c.fetchone()
@@ -761,7 +817,6 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
             channel_mult = cm_data[0]
             boosts_text += f"⚡ **Channel Boost**: x{channel_mult}\n"
 
-    # C. Role Boost
     role_mult = 1.0
     async with bot.db.execute("SELECT role_id, multiplier FROM role_multipliers WHERE guild_id=?", (interaction.guild.id,)) as c:
         db_roles = {row[0]: row[1] for row in await c.fetchall()}
@@ -771,12 +826,10 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
             role_mult += bonus
             boosts_text += f"🛡️ **{role.name}**: x{db_roles[role.id]}\n"
     
-    # D. Rebirth Boost
     rebirth_mult = 1.0 + (rebirth * 0.2)
     if rebirth > 0:
         boosts_text += f"🔄 **Rebirth {to_roman(rebirth)}**: x{round(rebirth_mult, 1)}\n"
 
-    # E. Temp/Friend Boost
     temp_mult = 1.0
     async with bot.db.execute("SELECT end_time, multiplier FROM active_boosts WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
         temp = await c.fetchone()
@@ -784,10 +837,8 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
         temp_mult = temp[1]
         boosts_text += f"🎁 **Friend Gift**: x{temp_mult}\n"
 
-    # 4. Total Multiplier Calculation
     grand_total = global_mult * channel_mult * role_mult * rebirth_mult * temp_mult
 
-    # 5. Build Embed
     embed = discord.Embed(title=f"🛡️ {target.display_name}", description=f"*{bio}*", color=target.color)
     if target.display_avatar: embed.set_thumbnail(url=target.display_avatar.url)
     
@@ -833,7 +884,6 @@ async def on_app_command_error(i: discord.Interaction, e: app_commands.AppComman
 @bot.command()
 @commands.is_owner()
 async def sync(ctx):
-    # This copies the global commands to the server where you typed !sync
     bot.tree.copy_global_to(guild=ctx.guild)
     synced = await bot.tree.sync(guild=ctx.guild)
     await ctx.send(f"✅ **Synced {len(synced)} commands to {ctx.guild.name}!**")
@@ -844,42 +894,31 @@ async def sync(ctx):
 async def sync_roles(interaction: discord.Interaction, target: discord.Member = None):
     await interaction.response.defer(ephemeral=True)
     
-    # 1. Fetch all Level Roles for this server
     async with bot.db.execute("SELECT level, role_id FROM level_roles WHERE guild_id = ? ORDER BY level DESC", (interaction.guild.id,)) as c:
         role_data = await c.fetchall()
     
     if not role_data:
         return await interaction.followup.send("❌ No level roles are configured yet!")
 
-    # Format: [(Level, RoleID), (Level, RoleID)...] sorted highest to lowest
     all_role_ids = {r[1] for r in role_data}
 
-    # 2. Define the Sync Logic
     async def sync_user(member):
-        # Fetch user's level
         async with bot.db.execute("SELECT level FROM users WHERE user_id=? AND guild_id=?", (member.id, interaction.guild.id)) as c:
             d = await c.fetchone()
-        
-        # If user isn't in DB, skip
         if not d: return False 
         
         user_level = d[0]
         correct_role_id = None
         
-        # Find the highest role they are eligible for
         for lvl, r_id in role_data:
             if user_level >= lvl:
                 correct_role_id = r_id
-                break # Stop at the highest one
-        
-        # If no role matches (e.g. Level 1), correct_role_id remains None
+                break 
         
         roles_to_add = []
         roles_to_remove = []
-        
         user_role_ids = [r.id for r in member.roles]
 
-        # Calculate Add/Remove
         if correct_role_id and correct_role_id not in user_role_ids:
             r = member.guild.get_role(correct_role_id)
             if r: roles_to_add.append(r)
@@ -889,7 +928,6 @@ async def sync_roles(interaction: discord.Interaction, target: discord.Member = 
                 r = member.guild.get_role(r_id)
                 if r: roles_to_remove.append(r)
         
-        # Apply Changes
         if roles_to_add or roles_to_remove:
             try:
                 if roles_to_remove: await member.remove_roles(*roles_to_remove)
@@ -899,23 +937,19 @@ async def sync_roles(interaction: discord.Interaction, target: discord.Member = 
                 return False
         return False
 
-    # 3. Execution
     if target:
-        # Sync SINGLE user
         modified = await sync_user(target)
         if modified:
             await interaction.followup.send(f"✅ **Synced:** {target.mention} roles have been updated.")
         else:
             await interaction.followup.send(f"👍 **Up to Date:** {target.mention} already has the correct roles.")
     else:
-        # Sync EVERYONE
         await interaction.followup.send("🔄 **Syncing Server...** This may take a moment.")
         count = 0
         for member in interaction.guild.members:
             if member.bot: continue
             if await sync_user(member):
                 count += 1
-                # Small sleep to prevent rate limits if updating hundreds of people
                 await discord.utils.sleep_until(discord.utils.utcnow() + datetime.timedelta(seconds=0.5))
         
         await interaction.followup.send(f"✅ **Complete:** Updated roles for **{count}** users.")
@@ -925,7 +959,6 @@ async def sync_roles(interaction: discord.Interaction, target: discord.Member = 
 async def debug_rank(interaction: discord.Interaction, target: discord.Member):
     await interaction.response.defer(ephemeral=True)
 
-    # 1. Get User Data
     async with bot.db.execute("SELECT level, xp FROM users WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
         u_data = await c.fetchone()
     
@@ -934,7 +967,6 @@ async def debug_rank(interaction: discord.Interaction, target: discord.Member):
     
     u_level = u_data[0]
     
-    # 2. Get All Roles
     async with bot.db.execute("SELECT level, role_id FROM level_roles WHERE guild_id=? ORDER BY level DESC", (interaction.guild.id,)) as c:
         roles = await c.fetchall()
 
@@ -945,12 +977,10 @@ async def debug_rank(interaction: discord.Interaction, target: discord.Member):
 
     best_match = None
 
-    # 3. Simulate the Loop
     for lvl, r_id in roles:
         role_obj = interaction.guild.get_role(r_id)
         role_name = role_obj.name if role_obj else "⚠️ DELETED ROLE"
         
-        # Check comparison
         is_high_enough = u_level >= lvl
         marker = "✅" if is_high_enough else "❌"
         
@@ -960,7 +990,6 @@ async def debug_rank(interaction: discord.Interaction, target: discord.Member):
             best_match = r_id
             log.append(f"   🎉 **MATCH FOUND!** Bot selected: {role_name}")
             
-            # 4. Check Hierarchy / Permissions
             if role_obj:
                 bot_member = interaction.guild.get_member(bot.user.id)
                 if role_obj.position >= bot_member.top_role.position:
@@ -973,5 +1002,43 @@ async def debug_rank(interaction: discord.Interaction, target: discord.Member):
                 log.append(f"   ⚠️ Role ID {r_id} does not exist in Discord.")
 
     await interaction.followup.send("\n".join(log))
+
+@bot.tree.command(name="debug_user_db", description="View raw database row for a specific user")
+@app_commands.checks.has_permissions(administrator=True)
+async def debug_user_db(interaction: discord.Interaction, target: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+
+    async with bot.db.execute("SELECT * FROM users WHERE user_id = ?", (target.id,)) as c:
+        row = await c.fetchone()
+        columns = [description[0] for description in c.description]
+
+    if not row:
+        return await interaction.followup.send(f"❌ **{target.display_name}** was not found in the database at all.")
+
+    data_list = dict(zip(columns, row))
     
+    debug_msg = [f"📊 **Raw DB Data for {target.mention}**"]
+    for key, value in data_list.items():
+        val_type = type(value).__name__
+        debug_msg.append(f"• `{key}`: **{value}** (Type: `{val_type}`)")
+
+    current_guild_id = interaction.guild.id
+    db_guild_id = data_list.get('guild_id')
+
+    debug_msg.append("\n🔎 **Leaderboard Compatibility Check:**")
+    
+    if str(db_guild_id) != str(current_guild_id):
+        debug_msg.append(f"⚠️ **MISMATCH:** User is registered under Guild ID `{db_guild_id}`, but this server is `{current_guild_id}`. They won't appear on this leaderboard.")
+    else:
+        debug_msg.append("✅ **Guild ID:** Matches this server.")
+
+    # FIXED: Typo here corrected from "s tored" to "stored"
+    if isinstance(data_list.get('xp'), str):
+        debug_msg.append("⚠️ **TYPE ERROR:** XP is stored as a `string`. This causes '9' to be ranked higher than '80'.")
+    else:
+        debug_msg.append("✅ **Data Type:** XP is a valid number.")
+
+    # FIXED: Removed the \ from the end of this line
+    await interaction.followup.send("\n".join(debug_msg))
+
 bot.run(os.getenv('DISCORD_TOKEN'))

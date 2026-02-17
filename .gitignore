@@ -19,3 +19,7 @@ env/
 
 # Ignore the local data directory (backups, logs, etc)
 data/
+
+# Docker & One-off Scripts
+Dockerfile
+import_data.py
