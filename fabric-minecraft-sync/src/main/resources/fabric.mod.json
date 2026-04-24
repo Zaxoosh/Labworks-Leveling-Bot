@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "labworks_level_sync",
+  "version": "${version}",
+  "name": "Labworks Level Sync",
+  "description": "Server-side Fabric activity sync for the Labworks Discord leveling bot.",
+  "authors": ["Labworks"],
+  "environment": "server",
+  "entrypoints": {
+    "server": [
+      "com.labworks.levelsync.LabworksLevelSync"
+    ]
+  },
+  "mixins": [
+    "labworks_level_sync.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "fabric-api": "*",
+    "java": ">=21"
+  }
+}

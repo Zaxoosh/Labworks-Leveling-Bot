@@ -8,8 +8,12 @@ import time
 import datetime
 import asyncio
 import io
+import math
+import secrets
+import string
 from pathlib import Path
 from dotenv import load_dotenv
+from aiohttp import web
 
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
@@ -19,7 +23,8 @@ except ImportError:
     PIL_AVAILABLE = False
     RESAMPLE_LANCZOS = None
 
-load_dotenv(override=False)
+APP_DIR = Path(__file__).resolve().parent
+load_dotenv(APP_DIR / ".env", override=False)
 
 TEST_GUILD_ID = 1041046184552308776
 TEST_GUILD = discord.Object(id=TEST_GUILD_ID)
@@ -27,11 +32,26 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 DATA_DIR = PROJECT_ROOT / "data"
 RANK_CARD_DIR = DATA_DIR / "rank_cards"
+ASSETS_DIR = PROJECT_ROOT / "assets"
+FONT_DIR = ASSETS_DIR / "fonts"
 DEFAULT_QUIET_EVENT_MULTIPLIER = 2.0
 DEFAULT_QUIET_EVENT_MIN_SILENCE = 45 * 60
 DEFAULT_QUIET_EVENT_DURATION = 20 * 60
 DEFAULT_QUIET_EVENT_COOLDOWN = 3 * 60 * 60
 VOICE_XP_PER_MINUTE = 10
+GITHUB_SPONSORS_URL = "https://github.com/sponsors/Zaxoosh"
+SPONSOR_PROMO_LINES = [
+    "Sponsor from $2/mo for an XP boost, sponsor role, and access to the Sponsor Lounge.",
+    "Sponsor from $5/mo to add a passive XP salary and voting power on future updates.",
+    "Studio Partner sponsorship adds rank-card flair, rebirth perks, and stronger gifting perks.",
+]
+MINECRAFT_API_HOST = os.getenv("MINECRAFT_API_HOST", "0.0.0.0")
+MINECRAFT_API_PORT = int(os.getenv("MINECRAFT_API_PORT", "8095"))
+MINECRAFT_API_TOKEN = os.getenv("MINECRAFT_API_TOKEN", "")
+MINECRAFT_DAILY_XP_CAP = int(os.getenv("MINECRAFT_DAILY_XP_CAP", "1500"))
+MINECRAFT_LINK_CODE_TTL_SECONDS = int(os.getenv("MINECRAFT_LINK_CODE_TTL_SECONDS", "900"))
+MINECRAFT_TARGET_GUILD_ID = int(os.getenv("MINECRAFT_TARGET_GUILD_ID", "0") or 0)
+MINECRAFT_ANNOUNCE_ENABLED = os.getenv("MINECRAFT_ANNOUNCE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 
 
 def resolve_database_path():
@@ -62,6 +82,50 @@ def to_roman(num):
         i += 1
     return roman_num if roman_num else "0"
 
+
+def xp_needed_for_level(level: int) -> int:
+    return 5 * (level ** 2) + (50 * level) + 100
+
+
+def total_xp_for_state(level: int, xp: int) -> int:
+    previous_levels = max(0, level - 1)
+    cumulative = (
+        5 * previous_levels * (previous_levels + 1) * ((2 * previous_levels) + 1) // 6
+        + 25 * previous_levels * (previous_levels + 1)
+        + 100 * previous_levels
+    )
+    return cumulative + max(0, xp)
+
+
+def format_voice_time(total_minutes: int) -> str:
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if hours <= 0:
+        return f"{minutes}M"
+    if minutes == 0:
+        return f"{hours}H"
+    return f"{hours}H {minutes}M"
+
+
+async def get_sponsor_tier_for_user(user_id: int, guild_id: int):
+    async with bot.db.execute(
+        "SELECT tier_name FROM sponsors WHERE user_id = ? AND guild_id = ?",
+        (user_id, guild_id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def maybe_apply_sponsor_promo(embed: discord.Embed, user_id: int, guild_id: int, chance: float = 0.18, force_show: bool = False):
+    if await get_sponsor_tier_for_user(user_id, guild_id):
+        return embed
+    if not force_show and random.random() > chance:
+        return embed
+
+    promo_line = random.choice(SPONSOR_PROMO_LINES)
+    embed.set_footer(text=f"{promo_line} {GITHUB_SPONSORS_URL}")
+    return embed
+
 # --- DB SETUP ---
 class LevelBot(commands.Bot):
     def __init__(self):
@@ -74,10 +138,13 @@ class LevelBot(commands.Bot):
         self.start_time = datetime.datetime.now(datetime.timezone.utc)
         self.ready_announced = False
         self.current_lifecycle_state = "starting"
+        self.minecraft_api_runner = None
+        self.minecraft_api_site = None
         
     async def setup_hook(self):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         RANK_CARD_DIR.mkdir(parents=True, exist_ok=True)
+        FONT_DIR.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = await aiosqlite.connect(self.db_path.as_posix())
 
@@ -90,6 +157,7 @@ class LevelBot(commands.Bot):
                 weekly_xp INTEGER DEFAULT 0,
                 monthly_xp INTEGER DEFAULT 0,
                 message_count INTEGER DEFAULT 0,
+                voice_minutes INTEGER DEFAULT 0,
                 level INTEGER DEFAULT 1, 
                 rebirth INTEGER DEFAULT 0, 
                 next_xp_time REAL DEFAULT 0, 
@@ -109,6 +177,9 @@ class LevelBot(commands.Bot):
                 global_xp_mult REAL DEFAULT 1.0,
                 audit_channel_id INTEGER DEFAULT 0,
                 status_channel_id INTEGER DEFAULT 0,
+                minecraft_announce_channel_id INTEGER DEFAULT 0,
+                minecraft_announce_enabled INTEGER DEFAULT 0,
+                minecraft_daily_xp_cap INTEGER DEFAULT 1500,
                 quiet_event_until REAL DEFAULT 0,
                 quiet_event_multiplier REAL DEFAULT 1.0,
                 last_message_at REAL DEFAULT 0,
@@ -123,6 +194,38 @@ class LevelBot(commands.Bot):
         await self.db.execute("CREATE TABLE IF NOT EXISTS level_roles (level INTEGER, role_id INTEGER, guild_id INTEGER, PRIMARY KEY (level, guild_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS sponsors (user_id INTEGER, guild_id INTEGER, tier_name TEXT, PRIMARY KEY (user_id, guild_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS minecraft_links (
+                minecraft_uuid TEXT PRIMARY KEY,
+                minecraft_name TEXT,
+                discord_id INTEGER UNIQUE,
+                linked_at TIMESTAMP
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS minecraft_link_codes (
+                code TEXT PRIMARY KEY,
+                discord_id INTEGER UNIQUE,
+                guild_id INTEGER,
+                expires_at REAL,
+                created_at REAL
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS minecraft_xp_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                minecraft_uuid TEXT,
+                discord_id INTEGER,
+                event_type TEXT,
+                event_key TEXT,
+                xp_awarded INTEGER,
+                created_at TIMESTAMP
+            )
+        """)
+        await self.db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_minecraft_xp_events_idempotency
+            ON minecraft_xp_events (minecraft_uuid, event_type, event_key)
+        """)
 
         await self.ensure_column(
             "guild_settings",
@@ -149,6 +252,31 @@ class LevelBot(commands.Bot):
             "last_quiet_event_at",
             "REAL DEFAULT 0",
         )
+        await self.ensure_column(
+            "guild_settings",
+            "quiet_event_channel_id",
+            "INTEGER DEFAULT 0",
+        )
+        await self.ensure_column(
+            "guild_settings",
+            "minecraft_announce_channel_id",
+            "INTEGER DEFAULT 0",
+        )
+        await self.ensure_column(
+            "guild_settings",
+            "minecraft_announce_enabled",
+            "INTEGER DEFAULT 0",
+        )
+        await self.ensure_column(
+            "guild_settings",
+            "minecraft_daily_xp_cap",
+            f"INTEGER DEFAULT {MINECRAFT_DAILY_XP_CAP}",
+        )
+        await self.ensure_column(
+            "users",
+            "voice_minutes",
+            "INTEGER DEFAULT 0",
+        )
 
         previous_clean_shutdown = (await self.get_meta("clean_shutdown", "1")) == "1"
         previous_heartbeat = float(await self.get_meta("last_heartbeat", "0") or 0)
@@ -164,6 +292,12 @@ class LevelBot(commands.Bot):
         self.reset_stats_loop.start()
         self.quiet_event_loop.start()
         self.heartbeat_loop.start()
+        self.presence_refresh_loop.start()
+
+        if MINECRAFT_API_TOKEN:
+            await self.start_minecraft_api()
+        else:
+            print("Minecraft API disabled: set MINECRAFT_API_TOKEN to enable it.")
 
         self.tree.copy_global_to(guild=TEST_GUILD)
         await self.tree.sync(guild=TEST_GUILD)
@@ -172,11 +306,15 @@ class LevelBot(commands.Bot):
         self.previous_heartbeat = previous_heartbeat
 
     async def close(self):
-        await self.announce_lifecycle("shutdown")
-        await self.set_meta("clean_shutdown", "1")
-        await self.set_meta("last_shutdown_at", str(time.time()))
-        await self.db.commit()
-        await self.db.close()
+        if hasattr(self, "db"):
+            await self.announce_lifecycle("shutdown")
+            await self.set_meta("clean_shutdown", "1")
+            await self.set_meta("last_shutdown_at", str(time.time()))
+            await self.db.commit()
+        if self.minecraft_api_runner:
+            await self.minecraft_api_runner.cleanup()
+        if hasattr(self, "db"):
+            await self.db.close()
         await super().close()
 
     async def ensure_column(self, table_name, column_name, column_sql):
@@ -206,6 +344,7 @@ class LevelBot(commands.Bot):
                 weekly_xp,
                 monthly_xp,
                 message_count,
+                voice_minutes,
                 level,
                 rebirth,
                 next_xp_time,
@@ -213,7 +352,7 @@ class LevelBot(commands.Bot):
                 custom_msg,
                 birthday,
                 last_gift_used
-            ) VALUES (?, ?, 0, 0, 0, 0, 1, 0, 0, 'No bio set.', NULL, NULL, 0)
+            ) VALUES (?, ?, 0, 0, 0, 0, 0, 1, 0, 0, 'No bio set.', NULL, NULL, 0)
             """,
             (member.id, member.guild.id),
         )
@@ -232,6 +371,10 @@ class LevelBot(commands.Bot):
                    global_xp_mult,
                    audit_channel_id,
                    status_channel_id,
+                   quiet_event_channel_id,
+                   minecraft_announce_channel_id,
+                   minecraft_announce_enabled,
+                   minecraft_daily_xp_cap,
                    quiet_event_until,
                    quiet_event_multiplier,
                    last_message_at,
@@ -251,10 +394,14 @@ class LevelBot(commands.Bot):
             "global_xp_mult": row[3],
             "audit_channel_id": row[4],
             "status_channel_id": row[5],
-            "quiet_event_until": row[6],
-            "quiet_event_multiplier": row[7],
-            "last_message_at": row[8],
-            "last_quiet_event_at": row[9],
+            "quiet_event_channel_id": row[6],
+            "minecraft_announce_channel_id": row[7],
+            "minecraft_announce_enabled": row[8],
+            "minecraft_daily_xp_cap": row[9],
+            "quiet_event_until": row[10],
+            "quiet_event_multiplier": row[11],
+            "last_message_at": row[12],
+            "last_quiet_event_at": row[13],
         }
 
     def get_configured_channel(self, guild: discord.Guild, channel_id: int):
@@ -279,12 +426,22 @@ class LevelBot(commands.Bot):
                 return channel
         return None
 
+    async def get_quiet_event_channel(self, guild: discord.Guild):
+        settings = await self.fetch_guild_settings(guild.id)
+        quiet_channel = self.get_configured_channel(guild, settings.get("quiet_event_channel_id", 0) if settings else 0)
+        if quiet_channel:
+            return quiet_channel
+        return await self.get_announcement_channel(guild)
+
     async def announce_lifecycle(self, event_name: str, target_guild: discord.Guild = None):
         guilds = [target_guild] if target_guild else list(self.guilds)
         for guild in guilds:
             if not guild:
                 continue
-            channel = await self.get_announcement_channel(guild)
+            if event_name in {"quiet_event_start", "quiet_event_end"}:
+                channel = await self.get_quiet_event_channel(guild)
+            else:
+                channel = await self.get_announcement_channel(guild)
             if not channel:
                 continue
 
@@ -333,6 +490,7 @@ class LevelBot(commands.Bot):
                 ("Birthday channel", "birthday_channel_id"),
                 ("Audit channel", "audit_channel_id"),
                 ("Status channel", "status_channel_id"),
+                ("Quiet event channel", "quiet_event_channel_id"),
             ):
                 channel = self.get_configured_channel(guild, settings.get(key, 0))
                 if settings.get(key, 0) and not channel:
@@ -423,6 +581,215 @@ class LevelBot(commands.Bot):
             return True
         except discord.Forbidden:
             return False
+
+    async def start_minecraft_api(self):
+        app = web.Application()
+        app.router.add_post("/minecraft/activity", self.handle_minecraft_activity)
+        app.router.add_get("/minecraft/health", self.handle_minecraft_health)
+        self.minecraft_api_runner = web.AppRunner(app)
+        await self.minecraft_api_runner.setup()
+        self.minecraft_api_site = web.TCPSite(self.minecraft_api_runner, MINECRAFT_API_HOST, MINECRAFT_API_PORT)
+        await self.minecraft_api_site.start()
+        print(f"Minecraft API listening on {MINECRAFT_API_HOST}:{MINECRAFT_API_PORT}")
+
+    async def handle_minecraft_health(self, request):
+        return web.json_response({"ok": True, "service": "labworks-minecraft-api"})
+
+    def minecraft_api_authorized(self, request):
+        auth_header = request.headers.get("Authorization", "")
+        bearer_token = auth_header.removeprefix("Bearer ").strip()
+        header_token = request.headers.get("X-API-Token", "").strip()
+        return secrets.compare_digest(bearer_token or header_token, MINECRAFT_API_TOKEN)
+
+    async def handle_minecraft_activity(self, request):
+        if not MINECRAFT_API_TOKEN or not self.minecraft_api_authorized(request):
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+        event_type = str(payload.get("event_type", "")).strip().lower()
+        if event_type == "link":
+            return await self.handle_minecraft_link_payload(payload)
+
+        minecraft_uuid = str(payload.get("minecraft_uuid", "")).strip()
+        minecraft_name = str(payload.get("minecraft_name", "")).strip()[:32]
+        event_key = str(payload.get("event_key", "")).strip()
+        xp_requested = int(payload.get("xp", 0) or 0)
+
+        if not minecraft_uuid or not event_type or not event_key or xp_requested <= 0:
+            return web.json_response({"ok": False, "error": "missing_required_fields"}, status=400)
+
+        async with self.db.execute(
+            "SELECT discord_id FROM minecraft_links WHERE minecraft_uuid = ?",
+            (minecraft_uuid,),
+        ) as cursor:
+            link = await cursor.fetchone()
+        if not link:
+            return web.json_response({"ok": False, "error": "minecraft_account_not_linked"}, status=404)
+
+        discord_id = int(link[0])
+        member = self.find_minecraft_reward_member(discord_id)
+        if not member:
+            return web.json_response({"ok": False, "error": "discord_member_not_found"}, status=404)
+
+        duplicate = await self.minecraft_event_exists(minecraft_uuid, event_type, event_key)
+        if duplicate:
+            return web.json_response({"ok": True, "duplicate": True, "xp_awarded": 0})
+
+        settings = await self.fetch_guild_settings(member.guild.id)
+        daily_cap = int(settings.get("minecraft_daily_xp_cap") or MINECRAFT_DAILY_XP_CAP) if settings else MINECRAFT_DAILY_XP_CAP
+        today_awarded = await self.get_minecraft_daily_xp(discord_id)
+        remaining_cap = max(0, daily_cap - today_awarded)
+        xp_awarded = min(xp_requested, remaining_cap)
+
+        await self.log_minecraft_xp_event(
+            minecraft_uuid=minecraft_uuid,
+            discord_id=discord_id,
+            event_type=event_type,
+            event_key=event_key,
+            xp_awarded=xp_awarded,
+        )
+
+        if minecraft_name:
+            await self.db.execute(
+                "UPDATE minecraft_links SET minecraft_name = ? WHERE minecraft_uuid = ?",
+                (minecraft_name, minecraft_uuid),
+            )
+
+        if xp_awarded > 0:
+            await self.add_xp(member, xp_awarded, can_announce_level_up=False)
+            await self.announce_minecraft_xp(member, minecraft_name or minecraft_uuid, event_type, xp_awarded)
+        else:
+            await self.db.commit()
+
+        return web.json_response({
+            "ok": True,
+            "discord_id": discord_id,
+            "xp_awarded": xp_awarded,
+            "daily_cap": daily_cap,
+            "daily_awarded": today_awarded + xp_awarded,
+        })
+
+    async def handle_minecraft_link_payload(self, payload):
+        code = str(payload.get("code", "")).strip().upper()
+        minecraft_uuid = str(payload.get("minecraft_uuid", "")).strip()
+        minecraft_name = str(payload.get("minecraft_name", "")).strip()[:32]
+        now = time.time()
+
+        if not code or not minecraft_uuid:
+            return web.json_response({"ok": False, "error": "missing_link_fields"}, status=400)
+
+        async with self.db.execute(
+            "SELECT discord_id, guild_id, expires_at FROM minecraft_link_codes WHERE code = ?",
+            (code,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if not row:
+            return web.json_response({"ok": False, "error": "invalid_code"}, status=404)
+
+        discord_id, guild_id, expires_at = row
+        if expires_at < now:
+            await self.db.execute("DELETE FROM minecraft_link_codes WHERE code = ?", (code,))
+            await self.db.commit()
+            return web.json_response({"ok": False, "error": "expired_code"}, status=410)
+
+        await self.db.execute("DELETE FROM minecraft_links WHERE discord_id = ? OR minecraft_uuid = ?", (discord_id, minecraft_uuid))
+        await self.db.execute(
+            """
+            INSERT INTO minecraft_links (minecraft_uuid, minecraft_name, discord_id, linked_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (minecraft_uuid, minecraft_name, discord_id, datetime.datetime.utcnow().isoformat()),
+        )
+        await self.db.execute("DELETE FROM minecraft_link_codes WHERE code = ?", (code,))
+        await self.db.commit()
+
+        guild = self.get_guild(int(guild_id)) if guild_id else None
+        member = guild.get_member(int(discord_id)) if guild else self.find_minecraft_reward_member(int(discord_id))
+        if member:
+            try:
+                await member.send(f"Your Minecraft account **{minecraft_name or minecraft_uuid}** is now linked.")
+            except discord.Forbidden:
+                pass
+
+        return web.json_response({"ok": True, "discord_id": int(discord_id), "minecraft_uuid": minecraft_uuid})
+
+    def find_minecraft_reward_member(self, discord_id: int):
+        if MINECRAFT_TARGET_GUILD_ID:
+            guild = self.get_guild(MINECRAFT_TARGET_GUILD_ID)
+            return guild.get_member(discord_id) if guild else None
+
+        for guild in self.guilds:
+            member = guild.get_member(discord_id)
+            if member:
+                return member
+        return None
+
+    async def minecraft_event_exists(self, minecraft_uuid: str, event_type: str, event_key: str):
+        async with self.db.execute(
+            """
+            SELECT 1 FROM minecraft_xp_events
+            WHERE minecraft_uuid = ? AND event_type = ? AND event_key = ?
+            """,
+            (minecraft_uuid, event_type, event_key),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def get_minecraft_daily_xp(self, discord_id: int):
+        start_of_day = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        async with self.db.execute(
+            """
+            SELECT COALESCE(SUM(xp_awarded), 0)
+            FROM minecraft_xp_events
+            WHERE discord_id = ? AND created_at >= ?
+            """,
+            (discord_id, start_of_day),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0] or 0)
+
+    async def log_minecraft_xp_event(self, minecraft_uuid: str, discord_id: int, event_type: str, event_key: str, xp_awarded: int):
+        await self.db.execute(
+            """
+            INSERT INTO minecraft_xp_events (
+                minecraft_uuid,
+                discord_id,
+                event_type,
+                event_key,
+                xp_awarded,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                minecraft_uuid,
+                discord_id,
+                event_type,
+                event_key,
+                xp_awarded,
+                datetime.datetime.utcnow().isoformat(),
+            ),
+        )
+
+    async def announce_minecraft_xp(self, member: discord.Member, minecraft_name: str, event_type: str, xp_awarded: int):
+        settings = await self.fetch_guild_settings(member.guild.id)
+        enabled = bool(settings.get("minecraft_announce_enabled")) if settings else MINECRAFT_ANNOUNCE_ENABLED
+        if not enabled:
+            return
+
+        channel = self.get_configured_channel(member.guild, settings.get("minecraft_announce_channel_id", 0) if settings else 0)
+        if not channel:
+            channel = await self.get_announcement_channel(member.guild)
+        if not channel:
+            return
+
+        try:
+            await channel.send(f"Minecraft XP: **{minecraft_name}** earned **{xp_awarded} XP** for `{event_type}`.")
+        except discord.Forbidden:
+            pass
     
     # --- LOGIC ---
     async def add_xp(self, member, amount, is_salary=False, can_announce_level_up=False):
@@ -608,6 +975,11 @@ class LevelBot(commands.Bot):
 
                     try:
                         await self.add_xp(member, VOICE_XP_PER_MINUTE)
+                        await self.db.execute(
+                            "UPDATE users SET voice_minutes = voice_minutes + 1 WHERE user_id = ? AND guild_id = ?",
+                            (member.id, guild.id),
+                        )
+                        await self.db.commit()
                         await asyncio.sleep(0.1)
                     except Exception as e:
                         print(f"Voice XP Error ({member.name}): {e}")
@@ -662,6 +1034,13 @@ class LevelBot(commands.Bot):
 
     @heartbeat_loop.before_loop
     async def before_heartbeat(self): await self.wait_until_ready()
+
+    @tasks.loop(minutes=15)
+    async def presence_refresh_loop(self):
+        await self.refresh_presence_status()
+
+    @presence_refresh_loop.before_loop
+    async def before_presence_refresh(self): await self.wait_until_ready()
 
     @tasks.loop(minutes=5)
     async def quiet_event_loop(self):
@@ -721,6 +1100,18 @@ class LevelBot(commands.Bot):
     @quiet_event_loop.before_loop
     async def before_quiet_event(self): await self.wait_until_ready()
 
+    async def refresh_presence_status(self):
+        async with self.db.execute("SELECT COUNT(DISTINCT user_id) FROM users") as cursor:
+            row = await cursor.fetchone()
+        tracked_users = row[0] if row and row[0] else 0
+        await self.change_presence(
+            status=discord.Status.online,
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name=f"{tracked_users} tracked users",
+            ),
+        )
+
 bot = LevelBot()
 
 async def calculate_multiplier(member):
@@ -741,10 +1132,7 @@ async def on_ready():
         return
 
     bot.ready_announced = True
-    await bot.change_presence(
-        status=discord.Status.online,
-        activity=discord.Activity(type=discord.ActivityType.watching, name="levels, boosts, and rank cards"),
-    )
+    await bot.refresh_presence_status()
     await bot.announce_lifecycle("startup")
 
     for guild in bot.guilds:
@@ -986,6 +1374,7 @@ class LeaderboardView(discord.ui.View):
         self.interaction = interaction
         self.page = 0
         self.sort_col = "xp" 
+        self.show_sponsor_promo = random.random() <= 0.16
         self.add_item(LeaderboardSelect()) 
 
     async def generate_embed(self):
@@ -1038,6 +1427,12 @@ class LeaderboardView(discord.ui.View):
             self.next_button.disabled = len(rows) < 10
 
         embed.set_footer(text=f"Page {self.page + 1} • Implemented on 08/02/2026. All tracking for messages started after that.")
+        embed = await maybe_apply_sponsor_promo(
+            embed,
+            self.interaction.user.id,
+            self.interaction.guild.id,
+            force_show=self.show_sponsor_promo,
+        )
         return embed
 
     async def update_view(self, interaction: discord.Interaction):
@@ -1078,6 +1473,7 @@ async def build_config_overview_embed(guild: discord.Guild):
     birthday_channel = bot.get_configured_channel(guild, settings["birthday_channel_id"] if settings else 0)
     audit_channel = bot.get_configured_channel(guild, settings["audit_channel_id"] if settings else 0)
     status_channel = bot.get_configured_channel(guild, settings["status_channel_id"] if settings else 0)
+    quiet_event_channel = bot.get_configured_channel(guild, settings["quiet_event_channel_id"] if settings else 0)
 
     async with bot.db.execute("SELECT COUNT(*) FROM level_roles WHERE guild_id = ?", (guild.id,)) as cursor:
         level_role_count = (await cursor.fetchone())[0]
@@ -1096,7 +1492,8 @@ async def build_config_overview_embed(guild: discord.Guild):
             f"Level-ups: {level_channel.mention if level_channel else 'Not set'}\n"
             f"Birthdays: {birthday_channel.mention if birthday_channel else 'Not set'}\n"
             f"Audit: {audit_channel.mention if audit_channel else 'Not set'}\n"
-            f"Status: {status_channel.mention if status_channel else 'Not set'}"
+            f"Status: {status_channel.mention if status_channel else 'Not set'}\n"
+            f"Quiet hours: {quiet_event_channel.mention if quiet_event_channel else 'Not set'}"
         ),
         inline=False,
     )
@@ -1225,6 +1622,12 @@ class ChannelActionView(ui.View):
         await bot.db.execute("UPDATE guild_settings SET birthday_channel_id = ? WHERE guild_id = ?", (self.channel.id, i.guild.id))
         await bot.db.commit()
         await i.response.send_message(f"✅ Routed to {self.channel.mention}.", ephemeral=True)
+    @ui.button(label="Route Quiet Hours", style=discord.ButtonStyle.secondary)
+    async def set_quiet(self, i, b):
+        await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (i.guild.id,))
+        await bot.db.execute("UPDATE guild_settings SET quiet_event_channel_id = ? WHERE guild_id = ?", (self.channel.id, i.guild.id))
+        await bot.db.commit()
+        await i.response.send_message(f"✅ Quiet hours announcements routed to {self.channel.mention}.", ephemeral=True)
 
 class SponsorTierSelect(ui.Select):
     def __init__(self, target_user):
@@ -1404,6 +1807,123 @@ async def healthcheck(interaction: discord.Interaction):
     embed = await build_health_check_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+def generate_minecraft_link_code():
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(6))
+
+
+@bot.tree.command(name="linkminecraft", description="Generate a code to link your Minecraft account")
+async def linkminecraft(interaction: discord.Interaction):
+    now = time.time()
+    await bot.db.execute("DELETE FROM minecraft_link_codes WHERE expires_at < ?", (now,))
+
+    code = generate_minecraft_link_code()
+    while True:
+        async with bot.db.execute("SELECT 1 FROM minecraft_link_codes WHERE code = ?", (code,)) as cursor:
+            if not await cursor.fetchone():
+                break
+        code = generate_minecraft_link_code()
+
+    await bot.db.execute(
+        """
+        INSERT OR REPLACE INTO minecraft_link_codes (
+            code,
+            discord_id,
+            guild_id,
+            expires_at,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            code,
+            interaction.user.id,
+            interaction.guild.id,
+            now + MINECRAFT_LINK_CODE_TTL_SECONDS,
+            now,
+        ),
+    )
+    await bot.db.commit()
+
+    minutes = max(1, MINECRAFT_LINK_CODE_TTL_SECONDS // 60)
+    await interaction.response.send_message(
+        f"Use `/linkdiscord {code}` in Minecraft within **{minutes} minutes** to link your account.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="minecraftprofile", description="View your linked Minecraft account and Minecraft XP status")
+async def minecraftprofile(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    async with bot.db.execute(
+        """
+        SELECT minecraft_uuid, minecraft_name, linked_at
+        FROM minecraft_links
+        WHERE discord_id = ?
+        """,
+        (target.id,),
+    ) as cursor:
+        link = await cursor.fetchone()
+
+    if not link:
+        await interaction.response.send_message(f"{target.mention} has not linked a Minecraft account yet.", ephemeral=True)
+        return
+
+    settings = await bot.fetch_guild_settings(interaction.guild.id)
+    daily_cap = int(settings.get("minecraft_daily_xp_cap") or MINECRAFT_DAILY_XP_CAP) if settings else MINECRAFT_DAILY_XP_CAP
+    daily_xp = await bot.get_minecraft_daily_xp(target.id)
+
+    embed = discord.Embed(title=f"Minecraft Profile: {target.display_name}", color=discord.Color.green())
+    embed.add_field(name="Minecraft Name", value=link[1] or "Unknown", inline=True)
+    embed.add_field(name="UUID", value=f"`{link[0]}`", inline=False)
+    embed.add_field(name="Today's Minecraft XP", value=f"**{daily_xp:,} / {daily_cap:,} XP**", inline=True)
+    embed.add_field(name="Linked At", value=link[2] or "Unknown", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="unlinkminecraft", description="Unlink your Minecraft account")
+async def unlinkminecraft(interaction: discord.Interaction):
+    async with bot.db.execute("SELECT minecraft_name FROM minecraft_links WHERE discord_id = ?", (interaction.user.id,)) as cursor:
+        link = await cursor.fetchone()
+    if not link:
+        await interaction.response.send_message("You do not have a linked Minecraft account.", ephemeral=True)
+        return
+
+    await bot.db.execute("DELETE FROM minecraft_links WHERE discord_id = ?", (interaction.user.id,))
+    await bot.db.commit()
+    await interaction.response.send_message(f"Unlinked Minecraft account **{link[0] or 'Unknown'}**.", ephemeral=True)
+
+
+@bot.tree.command(name="minecraftxpcap", description="Set the daily Minecraft XP cap for this server")
+@app_commands.checks.has_permissions(administrator=True)
+async def minecraftxpcap(interaction: discord.Interaction, amount: app_commands.Range[int, 0, 100000]):
+    await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
+    await bot.db.execute(
+        "UPDATE guild_settings SET minecraft_daily_xp_cap = ? WHERE guild_id = ?",
+        (int(amount), interaction.guild.id),
+    )
+    await bot.db.commit()
+    await interaction.response.send_message(f"Minecraft daily XP cap set to **{amount:,} XP**.", ephemeral=True)
+
+
+@bot.tree.command(name="minecraftannounce", description="Configure Minecraft XP gain announcements")
+@app_commands.checks.has_permissions(administrator=True)
+async def minecraftannounce(interaction: discord.Interaction, enabled: bool, channel: discord.TextChannel = None):
+    await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
+    await bot.db.execute(
+        """
+        UPDATE guild_settings
+        SET minecraft_announce_enabled = ?,
+            minecraft_announce_channel_id = ?
+        WHERE guild_id = ?
+        """,
+        (1 if enabled else 0, channel.id if channel else 0, interaction.guild.id),
+    )
+    await bot.db.commit()
+    destination = channel.mention if channel else "the default bot announcement channel"
+    state = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(f"Minecraft XP announcements are now **{state}** in {destination}.", ephemeral=True)
+
 # =========================================
 # 👑 SPONSORS & PROFILES
 # =========================================
@@ -1415,18 +1935,121 @@ def get_rank_background_path(guild_id: int, user_id: int):
 
 
 def load_rank_font(size: int, bold: bool = False):
-    preferred = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
-    try:
-        return ImageFont.truetype(preferred, size)
-    except Exception:
-        return ImageFont.load_default()
+    font_candidates = []
+    custom_font_path = os.getenv("LEVELBOT_FONT_BOLD" if bold else "LEVELBOT_FONT_REGULAR")
+    if custom_font_path:
+        font_candidates.append(Path(custom_font_path))
+
+    if bold:
+        font_candidates.extend([
+            FONT_DIR / "rank_bold.ttf",
+            FONT_DIR / "rank_semibold.ttf",
+            FONT_DIR / "rank.ttf",
+        ])
+    else:
+        font_candidates.extend([
+            FONT_DIR / "rank_regular.ttf",
+            FONT_DIR / "rank.ttf",
+        ])
+
+    windows_font_dir = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+    if bold:
+        font_candidates.extend([
+            windows_font_dir / "seguisb.ttf",
+            windows_font_dir / "segoeuib.ttf",
+            windows_font_dir / "arialbd.ttf",
+        ])
+    else:
+        font_candidates.extend([
+            windows_font_dir / "segoeui.ttf",
+            windows_font_dir / "arial.ttf",
+        ])
+
+    for candidate in font_candidates:
+        try:
+            if isinstance(candidate, Path) and candidate.exists():
+                return ImageFont.truetype(str(candidate), size)
+        except Exception:
+            continue
+
+    for fallback_name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf") if bold else ("DejaVuSans.ttf", "Arial.ttf"):
+        try:
+            return ImageFont.truetype(fallback_name, size)
+        except Exception:
+            continue
+
+    return ImageFont.load_default()
 
 
-async def create_rank_card(target: discord.Member, level: int, rebirth: int, xp: int, xp_needed: int, bio: str, boosts_text: str, sponsor_tier: str = None):
+async def fetch_rank_positions(user_id: int, guild_id: int, level: int, xp: int):
+    async with bot.db.execute(
+        """
+        SELECT COUNT(*) + 1
+        FROM users
+        WHERE guild_id = ?
+          AND (level > ? OR (level = ? AND xp > ?))
+        """,
+        (guild_id, level, level, xp),
+    ) as cursor:
+        server_rank = (await cursor.fetchone())[0]
+
+    async with bot.db.execute(
+        """
+        SELECT COUNT(*) + 1
+        FROM users
+        WHERE (level > ? OR (level = ? AND xp > ?))
+        """,
+        (level, level, xp),
+    ) as cursor:
+        global_rank = (await cursor.fetchone())[0]
+
+    return server_rank, global_rank
+
+
+async def fetch_role_rewards(guild: discord.Guild, current_level: int):
+    async with bot.db.execute(
+        "SELECT level, role_id FROM level_roles WHERE guild_id = ? ORDER BY level ASC",
+        (guild.id,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    upcoming = []
+    for unlock_level, role_id in rows:
+        if unlock_level <= current_level:
+            continue
+        role = guild.get_role(role_id)
+        if role:
+            upcoming.append((unlock_level, role))
+
+    next_reward = upcoming[0] if upcoming else None
+    return next_reward, upcoming[1:3]
+
+
+def fit_text(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
+
+
+async def create_rank_card(
+    target: discord.Member,
+    level: int,
+    rebirth: int,
+    xp: int,
+    xp_needed: int,
+    total_xp: int,
+    message_count: int,
+    voice_minutes: int,
+    server_rank: int,
+    global_rank: int,
+    bio: str,
+    boosts_text: str,
+    sponsor_tier: str = None,
+    next_reward=None,
+    upcoming_roles=None,
+):
     if not PIL_AVAILABLE:
         return None
 
-    width, height = 1100, 380
+    width, height = 1280, 760
     background_path = get_rank_background_path(target.guild.id, target.id)
     if background_path.exists():
         background = Image.open(background_path).convert("RGB")
@@ -1437,52 +2060,187 @@ async def create_rank_card(target: discord.Member, level: int, rebirth: int, xp:
         mask = Image.linear_gradient("L").resize((width, height))
         background = Image.composite(background, gradient, mask)
 
-    background = background.filter(ImageFilter.GaussianBlur(radius=1.4))
-    overlay = Image.new("RGBA", (width, height), (8, 11, 17, 155))
+    background = background.filter(ImageFilter.GaussianBlur(radius=1.8))
+    overlay = Image.new("RGBA", (width, height), (7, 10, 16, 170))
     card = Image.alpha_composite(background.convert("RGBA"), overlay)
     draw = ImageDraw.Draw(card)
 
-    draw.rounded_rectangle((28, 28, width - 28, height - 28), radius=26, outline=(255, 255, 255, 55), width=2, fill=(18, 24, 33, 165))
-    draw.rounded_rectangle((44, 44, 308, height - 44), radius=24, fill=(11, 16, 24, 175))
+    for inset, color in (
+        (18, (64, 180, 255, 32)),
+        (24, (168, 92, 255, 32)),
+    ):
+        draw.rounded_rectangle((inset, inset, width - inset, height - inset), radius=30, outline=color, width=6)
+    draw.rounded_rectangle((28, 28, width - 28, height - 28), radius=28, outline=(150, 196, 255, 130), width=2, fill=(18, 21, 30, 215))
+    draw.rounded_rectangle((58, 58, width - 58, height - 58), radius=24, fill=(15, 18, 25, 185))
 
-    avatar_bytes = await target.display_avatar.with_size(256).read()
-    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((190, 190), RESAMPLE_LANCZOS)
-    avatar_mask = Image.new("L", (190, 190), 0)
+    hex_outline = (122, 132, 161, 60)
+    for x, y in ((760, 120), (820, 90), (880, 124), (940, 96)):
+        points = [(x + 22 * math.cos(math.radians(angle)), y + 22 * math.sin(math.radians(angle))) for angle in range(30, 390, 60)]
+        draw.polygon(points, outline=hex_outline)
+
+    avatar_bytes = await target.display_avatar.with_size(512).read()
+    avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((188, 188), RESAMPLE_LANCZOS)
+    avatar_mask = Image.new("L", (188, 188), 0)
     avatar_draw = ImageDraw.Draw(avatar_mask)
-    avatar_draw.ellipse((0, 0, 190, 190), fill=255)
+    avatar_draw.ellipse((0, 0, 188, 188), fill=255)
     avatar.putalpha(avatar_mask)
-    card.paste(avatar, (82, 88), avatar)
+    avatar_x, avatar_y = 116, 122
+    for pad, color in ((24, (255, 215, 102, 110)), (18, (255, 225, 153, 180)), (11, (17, 22, 31, 255))):
+        draw.ellipse((avatar_x - pad, avatar_y - pad, avatar_x + 188 + pad, avatar_y + 188 + pad), fill=color)
+    card.paste(avatar, (avatar_x, avatar_y), avatar)
 
-    title_font = load_rank_font(40, bold=True)
-    body_font = load_rank_font(22)
-    stat_font = load_rank_font(26, bold=True)
-    tiny_font = load_rank_font(18)
+    title_font = load_rank_font(44, bold=True)
+    small_font = load_rank_font(18)
+    pill_font = load_rank_font(18, bold=True)
+    level_label_font = load_rank_font(25, bold=True)
+    level_value_font = load_rank_font(60, bold=True)
+    card_title_font = load_rank_font(17, bold=True)
+    stat_title_font = load_rank_font(22, bold=True)
+    stat_value_font = load_rank_font(34, bold=True)
+    bottom_title_font = load_rank_font(22, bold=True)
+    bottom_body_font = load_rank_font(17)
+    progress_font = load_rank_font(24, bold=True)
 
-    display_name = target.display_name[:24]
-    boost_lines = boosts_text.strip().splitlines()[:4] if boosts_text else []
     percent = min(100, max(0, int((xp / xp_needed) * 100))) if xp_needed else 0
     rebirth_text = to_roman(rebirth)
+    next_level_progress = min(1.0, max(0.0, xp / xp_needed)) if xp_needed else 0.0
 
-    draw.text((338, 62), display_name, font=title_font, fill=(243, 248, 255))
-    draw.text((338, 114), bio[:95], font=body_font, fill=(201, 214, 228))
+    def rounded_panel(box, fill=(33, 37, 47, 240), outline=(87, 97, 120, 90), radius=18):
+        draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=2)
 
-    sponsor_label = sponsor_tier or "Community Member"
-    draw.text((82, 294), sponsor_label, font=body_font, fill=(255, 221, 137))
-    draw.text((82, 320), f"@{target.name}"[:24], font=tiny_font, fill=(190, 202, 219))
+    def fit_font_size(text, max_width, base_size, bold=False, min_size=12):
+        size = base_size
+        while size >= min_size:
+            font = load_rank_font(size, bold=bold)
+            bbox = draw.textbbox((0, 0), text, font=font)
+            if (bbox[2] - bbox[0]) <= max_width:
+                return font
+            size -= 1
+        return load_rank_font(min_size, bold=bold)
 
-    draw.text((338, 168), f"Level {level}", font=stat_font, fill=(255, 255, 255))
-    draw.text((496, 168), f"Rebirth {rebirth_text}", font=stat_font, fill=(225, 230, 238))
-    draw.text((700, 168), f"{xp:,} / {xp_needed:,} XP", font=stat_font, fill=(225, 230, 238))
+    def draw_pill(box, label_prefix, label_value, accent_fill, accent_outline):
+        draw.rounded_rectangle(box, radius=14, fill=accent_fill, outline=accent_outline, width=2)
+        label_fill = (255, 214, 89) if "PRESTIGE" in label_prefix else (182, 206, 255)
+        pill_text = f"{label_prefix} {label_value}"
+        pill_max_width = (box[2] - box[0]) - 36
+        text_font = fit_font_size(pill_text, pill_max_width, 18, bold=True, min_size=14)
+        bbox = draw.textbbox((0, 0), pill_text, font=text_font)
+        text_x = box[0] + (((box[2] - box[0]) - (bbox[2] - bbox[0])) / 2)
+        text_y = box[1] + (((box[3] - box[1]) - (bbox[3] - bbox[1])) / 2) - 1
+        prefix_bbox = draw.textbbox((0, 0), label_prefix, font=text_font)
+        draw.text((text_x, text_y), label_prefix, font=text_font, fill=label_fill)
+        draw.text((text_x + (prefix_bbox[2] - prefix_bbox[0]) + 10, text_y), label_value, font=text_font, fill=(244, 248, 255))
 
-    bar_left, bar_top, bar_right, bar_bottom = 338, 224, 1038, 270
-    draw.rounded_rectangle((bar_left, bar_top, bar_right, bar_bottom), radius=18, fill=(33, 41, 54, 235))
+    def draw_centered_text_in_box(box, text, font, fill, y_offset=0):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        x = box[0] + ((box[2] - box[0] - text_width) / 2)
+        y = box[1] + ((box[3] - box[1] - text_height) / 2) + y_offset
+        draw.text((x, y), text, font=font, fill=fill)
+
+    def draw_right_aligned(x, y, text, font, fill):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        draw.text((x - (bbox[2] - bbox[0]), y), text, font=font, fill=fill)
+
+    draw.rounded_rectangle((430, 28, 850, 64), radius=18, fill=(21, 28, 38, 230), outline=(87, 171, 255, 180), width=2)
+    draw.text((450, 37), "DISCORD LEVELLING BOT", font=card_title_font, fill=(198, 216, 255))
+    draw.text((690, 37), "| Command: /rank", font=card_title_font, fill=(235, 236, 247))
+
+    draw_right_aligned(1110, 122, "LEVEL", level_label_font, (229, 233, 243))
+    draw_right_aligned(1180, 94, str(level), level_value_font, (255, 255, 255))
+
+    prestige_label = rebirth_text if rebirth > 0 else "0"
+    draw_pill((330, 210, 640, 264), "PRESTIGE:", prestige_label, (81, 62, 28, 220), (230, 191, 92, 180))
+    draw_pill((760, 210, 1120, 264), "SERVER RANK:", f"#{server_rank}", (48, 62, 97, 220), (112, 154, 244, 180))
+
+    rounded_panel((92, 318, 1188, 412), fill=(28, 32, 43, 240))
+    draw.text((120, 335), "LVL", font=small_font, fill=(234, 236, 242))
+    draw.text((164, 328), str(level), font=progress_font, fill=(255, 255, 255))
+    draw.text((608, 334), "LEVEL", font=small_font, fill=(214, 218, 229))
+    draw.text((1110, 335), "LVL", font=small_font, fill=(234, 236, 242))
+    draw.text((1153, 328), str(level + 1), font=progress_font, fill=(255, 255, 255))
+
+    bar_left, bar_top, bar_right, bar_bottom = 208, 354, 1088, 388
+    draw.rounded_rectangle((bar_left, bar_top, bar_right, bar_bottom), radius=17, fill=(18, 22, 33, 255), outline=(76, 84, 106, 120), width=2)
     progress_width = int((bar_right - bar_left) * (percent / 100))
     if progress_width > 0:
-        draw.rounded_rectangle((bar_left, bar_top, bar_left + progress_width, bar_bottom), radius=18, fill=(95, 186, 255, 255))
-    draw.text((338, 282), f"Progress: {percent}%", font=body_font, fill=(238, 244, 255))
+        gradient = Image.new("RGBA", (max(1, progress_width), bar_bottom - bar_top), color=0)
+        grad_draw = ImageDraw.Draw(gradient)
+        for px in range(max(1, progress_width)):
+            ratio = px / max(1, progress_width - 1)
+            r = int(42 + (72 - 42) * ratio)
+            g = int(82 + (131 - 82) * ratio)
+            b = int(255 + (255 - 255) * ratio)
+            grad_draw.line((px, 0, px, bar_bottom - bar_top), fill=(r, g, b, 255))
+        card.alpha_composite(gradient, dest=(bar_left, bar_top))
 
-    if boost_lines:
-        draw.text((338, 320), "Active boosts: " + " | ".join(line.replace("**", "") for line in boost_lines), font=tiny_font, fill=(200, 213, 229))
+    xp_progress_text = f"{xp:,} / {xp_needed:,} XP"
+    xp_bbox = draw.textbbox((0, 0), xp_progress_text, font=small_font)
+    xp_text_x = ((bar_left + bar_right) - (xp_bbox[2] - xp_bbox[0])) / 2
+    draw.text((xp_text_x, 392), xp_progress_text, font=small_font, fill=(150, 160, 189))
+
+    stat_boxes = [
+        ((92, 446, 409, 566), "TOTAL XP", f"{total_xp:,}", "XP"),
+        ((431, 446, 748, 566), "MESSAGES", f"{message_count:,}", "MS"),
+        ((770, 446, 1087, 566), "VOICE TIME", format_voice_time(voice_minutes), "VC"),
+    ]
+    for index, (box, label, value, icon) in enumerate(stat_boxes, start=1):
+        rounded_panel(box)
+        draw.text((box[0] + 18, box[1] + 20), icon, font=stat_title_font, fill=(255, 208, 88) if index == 1 else (173, 197, 255))
+        draw.text((box[0] + 84, box[1] + 20), f"{label}:", font=stat_title_font, fill=(240, 243, 249))
+        value_font = fit_font_size(value, (box[2] - box[0]) - 60, 34, bold=True, min_size=24)
+        draw_centered_text_in_box((box[0] + 30, box[1] + 54, box[2] - 30, box[3] - 18), value, value_font, (255, 255, 255), y_offset=6)
+        draw_right_aligned(box[2] - 16, box[1] + 14, str(index), small_font, (125, 133, 154))
+
+    rounded_panel((92, 588, 610, 704))
+    rounded_panel((632, 588, 1188, 704))
+    draw.text((116, 607), "NEXT REWARD:", font=bottom_title_font, fill=(245, 247, 255))
+    draw.text((656, 607), "UPCOMING ROLES:", font=bottom_title_font, fill=(245, 247, 255))
+
+    if next_reward:
+        reward_level, reward_role = next_reward
+        reward_text = fit_text(f"Level {reward_level} - {reward_role.name}", 28)
+        xp_remaining = max(0, total_xp_for_state(reward_level, 0) - total_xp)
+        ring_box = (130, 632, 200, 702)
+        draw.ellipse(ring_box, outline=(84, 92, 112, 255), width=8, fill=(21, 25, 35, 180))
+        draw.arc(ring_box, start=-90, end=-90 + int(360 * next_level_progress), fill=(96, 143, 255, 255), width=8)
+        inner_box = (144, 646, 186, 688)
+        draw.ellipse(inner_box, fill=(24, 28, 38, 255))
+        pct_text = f"{int(next_level_progress * 100)}%"
+        pct_font = fit_font_size(pct_text, 34, 16, bold=True, min_size=11)
+        pct_bbox = draw.textbbox((0, 0), pct_text, font=pct_font)
+        draw.text((165 - ((pct_bbox[2] - pct_bbox[0]) / 2), 667 - ((pct_bbox[3] - pct_bbox[1]) / 2)), pct_text, font=pct_font, fill=(220, 229, 252))
+        draw.text((202, 640), reward_text, font=bottom_body_font, fill=(245, 247, 255))
+        draw.text((202, 668), f"Needs {xp_remaining:,} more XP", font=bottom_body_font, fill=(189, 195, 212))
+    else:
+        ring_box = (130, 632, 200, 702)
+        draw.ellipse(ring_box, outline=(82, 164, 123, 255), width=8, fill=(21, 25, 35, 180))
+        inner_box = (144, 646, 186, 688)
+        draw.ellipse(inner_box, fill=(24, 28, 38, 255))
+        done_font = fit_font_size("DONE", 36, 13, bold=True, min_size=10)
+        done_bbox = draw.textbbox((0, 0), "DONE", font=done_font)
+        draw.text((165 - ((done_bbox[2] - done_bbox[0]) / 2), 667 - ((done_bbox[3] - done_bbox[1]) / 2)), "DONE", font=done_font, fill=(117, 220, 164))
+        draw.text((202, 648), "All configured rewards unlocked", font=bottom_body_font, fill=(245, 247, 255))
+
+    upcoming_roles = upcoming_roles or []
+    if upcoming_roles:
+        for idx, (unlock_level, role) in enumerate(upcoming_roles):
+            row_top = 628 + (idx * 48)
+            icon_fill = (255, 214, 89) if idx == 0 else (205, 170, 255)
+            bullet_x = 672
+            bullet_y = row_top + 12
+            draw.ellipse((bullet_x - 7, bullet_y - 7, bullet_x + 7, bullet_y + 7), fill=icon_fill)
+            role_name = fit_text(role.name, 24)
+            role_font = fit_font_size(role_name, 410, 17, bold=False, min_size=14)
+            role_bbox = draw.textbbox((0, 0), role_name, font=role_font)
+            detail_font = load_rank_font(15, bold=False)
+            xp_remaining = max(0, total_xp_for_state(unlock_level, 0) - total_xp)
+            detail_text = f"Needs {xp_remaining:,} XP"
+            draw.text((694, row_top - 2), role_name, font=role_font, fill=(245, 247, 255))
+            draw.text((694, row_top + (role_bbox[3] - role_bbox[1]) + 7), detail_text, font=detail_font, fill=(185, 191, 208))
+    else:
+        draw.text((658, 650), "No more configured roles", font=bottom_body_font, fill=(245, 247, 255))
 
     output = io.BytesIO()
     card.convert("RGB").save(output, format="PNG", optimize=True)
@@ -1501,7 +2259,16 @@ async def sponsors(interaction: discord.Interaction):
             if tier in tiers: tiers[tier].append(f"<@{uid}>")
         for t, m in tiers.items():
             if m: embed.add_field(name=f"✨ {t}", value="\n".join(m), inline=False)
-    embed.set_footer(text="Want to support Labworks? Visit github.com/sponsors/Zaxoosh")
+    embed.add_field(
+        name="Sponsor Benefits",
+        value=(
+            "`$2/mo` Sponsor role, x1.1 XP, credits, and Sponsor Lounge access.\n"
+            "`$5/mo` Adds a passive XP salary and voting power on community choices.\n"
+            "`$10/mo` Adds rank-card flair, rebirth perks, and stronger boost gifting."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text=f"Support Labworks at {GITHUB_SPONSORS_URL}")
     await interaction.response.send_message(embed=embed)
 
 class ProfileGroup(app_commands.Group):
@@ -1552,7 +2319,7 @@ class ProfileGroup(app_commands.Group):
             return await i.response.send_message("❌ I couldn't read that image. Try PNG or JPG.", ephemeral=True)
 
         output_path = get_rank_background_path(i.guild.id, i.user.id)
-        preview = ImageOps.fit(preview, (1100, 380), method=RESAMPLE_LANCZOS)
+        preview = ImageOps.fit(preview, (1280, 760), method=RESAMPLE_LANCZOS)
         preview.save(output_path, format="PNG", optimize=True)
         await i.response.send_message("✅ Custom rank-card background saved. Use `/rank` to preview it.", ephemeral=True)
     @app_commands.command(name="clear_card_background", description="Remove your custom rank-card background")
@@ -1599,14 +2366,15 @@ async def boost_user(interaction: discord.Interaction, target: discord.Member):
 async def rank(interaction: discord.Interaction, member: discord.Member = None):
     target = member or interaction.user
     
-    async with bot.db.execute("SELECT xp, level, rebirth, bio FROM users WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
+    async with bot.db.execute("SELECT xp, level, rebirth, bio, message_count, voice_minutes FROM users WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
         data = await c.fetchone()
     async with bot.db.execute("SELECT tier_name FROM sponsors WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
         s_data = await c.fetchone()
     
-    xp, level, rebirth, bio = data if data else (0, 1, 0, "No bio set.")
+    xp, level, rebirth, bio, message_count, voice_minutes = data if data else (0, 1, 0, "No bio set.", 0, 0)
     
-    xp_needed = 5 * (level ** 2) + (50 * level) + 100
+    xp_needed = xp_needed_for_level(level)
+    total_xp = total_xp_for_state(level, xp)
     percent = min(100, max(0, (xp / xp_needed) * 100))
     bar = "🟦" * int(percent / 10) + "⬜" * (10 - int(percent / 10))
     
@@ -1652,30 +2420,33 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
     grand_total = global_mult * quiet_mult * channel_mult * role_mult * rebirth_mult * temp_mult
 
     sponsor_tier = s_data[0] if s_data else None
+    server_rank, global_rank = await fetch_rank_positions(target.id, interaction.guild.id, level, xp)
+    next_reward, upcoming_roles = await fetch_role_rewards(interaction.guild, level)
     rank_card = await create_rank_card(
         target=target,
         level=level,
         rebirth=rebirth,
         xp=xp,
         xp_needed=xp_needed,
+        total_xp=total_xp,
+        message_count=message_count,
+        voice_minutes=voice_minutes,
+        server_rank=server_rank,
+        global_rank=global_rank,
         bio=bio,
         boosts_text=boosts_text,
         sponsor_tier=sponsor_tier,
+        next_reward=next_reward,
+        upcoming_roles=upcoming_roles,
     )
 
     if rank_card:
-        embed = discord.Embed(
-            title=f"🛡️ {target.display_name}",
-            description=f"Level **{level}** • Rebirth **{to_roman(rebirth)}** • Total Multiplier **x{round(grand_total, 2)}**",
-            color=target.color,
-        )
-        embed.add_field(name="Progress", value=f"`{bar}` **{int(percent)}%**\n`{xp} / {xp_needed} XP`", inline=False)
         if boosts_text:
+            embed = discord.Embed(color=target.color)
             embed.add_field(name="🚀 Active Boosts", value=boosts_text, inline=False)
-        embed.set_image(url=f"attachment://{rank_card.filename}")
-        if sponsor_tier == "Studio Partner":
-            embed.set_footer(text="💎 Global Studio Partner | Legend")
-        await interaction.response.send_message(embed=embed, file=rank_card)
+            await interaction.response.send_message(embed=embed, file=rank_card)
+        else:
+            await interaction.response.send_message(file=rank_card)
         return
 
     embed = discord.Embed(title=f"🛡️ {target.display_name}", description=f"*{bio}*", color=target.color)
@@ -1688,6 +2459,7 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
     if boosts_text:
         embed.add_field(name="🚀 Active Boosts", value=boosts_text, inline=False)
     embed.set_footer(text="Install Pillow to enable image rank cards.")
+    embed = await maybe_apply_sponsor_promo(embed, interaction.user.id, interaction.guild.id, chance=0.16)
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="rebirth", description="Reset to Level 1 for a permanent boost (Level 200+)")
@@ -1850,4 +2622,8 @@ async def debug_user_db(interaction: discord.Interaction, target: discord.Member
 
     await interaction.followup.send("\n".join(debug_msg))
 
-bot.run(os.getenv('DISCORD_TOKEN'))
+discord_token = os.getenv("DISCORD_TOKEN")
+if not discord_token:
+    raise RuntimeError("DISCORD_TOKEN is missing. Set it in src/.env or pass it as a container environment variable.")
+
+bot.run(discord_token)

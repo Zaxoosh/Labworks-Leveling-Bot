@@ -1,8 +1,13 @@
 # Credentials
 .env
+**/.env
+*.env
 
 # Database
 levels.db
+*.db
+*.db-shm
+*.db-wal
 
 # Python Folders
 __pycache__/
@@ -23,3 +28,19 @@ data/
 # Docker & One-off Scripts
 Dockerfile
 import_data.py
+
+# --- Minecraft Fabric Mod ---
+# Keep fabric-minecraft-sync source, Gradle config, and docs tracked.
+# Ignore generated build outputs and local Gradle caches.
+fabric-minecraft-sync/.gradle/
+fabric-minecraft-sync/build/
+fabric-minecraft-sync/out/
+fabric-minecraft-sync/run/
+
+# Local server/runtime files created while testing the mod.
+fabric-minecraft-sync/config/
+fabric-minecraft-sync/labworks-level-sync.json
+fabric-minecraft-sync/labworks-level-sync-progress.json
+fabric-minecraft-sync/*.log
+fabric-minecraft-sync/*.jar
+!fabric-minecraft-sync/gradle/wrapper/gradle-wrapper.jar
