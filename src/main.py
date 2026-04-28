@@ -183,7 +183,9 @@ class LevelBot(commands.Bot):
                 quiet_event_until REAL DEFAULT 0,
                 quiet_event_multiplier REAL DEFAULT 1.0,
                 last_message_at REAL DEFAULT 0,
-                last_quiet_event_at REAL DEFAULT 0
+                last_quiet_event_at REAL DEFAULT 0,
+                quiet_event_message_channel_id INTEGER DEFAULT 0,
+                quiet_event_message_id INTEGER DEFAULT 0
             )
         """)
         await self.db.execute("CREATE TABLE IF NOT EXISTS role_multipliers (role_id INTEGER PRIMARY KEY, guild_id INTEGER, multiplier REAL)")
@@ -255,6 +257,16 @@ class LevelBot(commands.Bot):
         await self.ensure_column(
             "guild_settings",
             "quiet_event_channel_id",
+            "INTEGER DEFAULT 0",
+        )
+        await self.ensure_column(
+            "guild_settings",
+            "quiet_event_message_channel_id",
+            "INTEGER DEFAULT 0",
+        )
+        await self.ensure_column(
+            "guild_settings",
+            "quiet_event_message_id",
             "INTEGER DEFAULT 0",
         )
         await self.ensure_column(
@@ -378,7 +390,9 @@ class LevelBot(commands.Bot):
                    quiet_event_until,
                    quiet_event_multiplier,
                    last_message_at,
-                   last_quiet_event_at
+                   last_quiet_event_at,
+                   quiet_event_message_channel_id,
+                   quiet_event_message_id
             FROM guild_settings
             WHERE guild_id = ?
             """,
@@ -402,6 +416,8 @@ class LevelBot(commands.Bot):
             "quiet_event_multiplier": row[11],
             "last_message_at": row[12],
             "last_quiet_event_at": row[13],
+            "quiet_event_message_channel_id": row[14],
+            "quiet_event_message_id": row[15],
         }
 
     def get_configured_channel(self, guild: discord.Guild, channel_id: int):
@@ -433,13 +449,130 @@ class LevelBot(commands.Bot):
             return quiet_channel
         return await self.get_announcement_channel(guild)
 
+    def build_quiet_event_embed(self, event_name: str):
+        embed = discord.Embed(color=discord.Color.blurple())
+        if event_name == "quiet_event_start":
+            embed.title = "🌙 Quiet Hours XP Event"
+            embed.description = (
+                f"Chat has gone quiet, so XP is temporarily boosted to "
+                f"**x{DEFAULT_QUIET_EVENT_MULTIPLIER}** for a little while."
+            )
+            embed.add_field(
+                name="How it works",
+                value="Send messages as normal while the event is active. This notice will update when the boost ends.",
+                inline=False,
+            )
+        elif event_name == "quiet_event_end":
+            embed.title = "🌤️ Quiet Hours XP Event Ended"
+            embed.description = "The temporary quiet-hours XP boost has ended."
+            embed.set_footer(text="This notice will clean itself up when chat resumes.")
+        return embed
+
+    async def clear_quiet_event_message_record(self, guild_id: int):
+        await self.db.execute(
+            """
+            UPDATE guild_settings
+            SET quiet_event_message_channel_id = 0,
+                quiet_event_message_id = 0
+            WHERE guild_id = ?
+            """,
+            (guild_id,),
+        )
+
+    async def fetch_quiet_event_message(self, guild: discord.Guild, settings: dict):
+        channel_id = settings.get("quiet_event_message_channel_id", 0) if settings else 0
+        message_id = settings.get("quiet_event_message_id", 0) if settings else 0
+        channel = self.get_configured_channel(guild, channel_id)
+        if not channel or not message_id:
+            return None
+        try:
+            return await channel.fetch_message(int(message_id))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+
+    async def announce_quiet_event(self, event_name: str, guild: discord.Guild):
+        settings = await self.fetch_guild_settings(guild.id)
+        channel = await self.get_quiet_event_channel(guild)
+        if not channel:
+            return
+
+        embed = self.build_quiet_event_embed(event_name)
+        if event_name == "quiet_event_start":
+            old_message = await self.fetch_quiet_event_message(guild, settings)
+            if old_message:
+                try:
+                    await old_message.delete()
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+            try:
+                message = await channel.send(embed=embed)
+            except discord.Forbidden:
+                return
+
+            await self.db.execute(
+                """
+                UPDATE guild_settings
+                SET quiet_event_message_channel_id = ?,
+                    quiet_event_message_id = ?
+                WHERE guild_id = ?
+                """,
+                (channel.id, message.id, guild.id),
+            )
+            await self.db.commit()
+            return
+
+        if event_name == "quiet_event_end":
+            message = await self.fetch_quiet_event_message(guild, settings)
+            if message:
+                try:
+                    await message.edit(embed=embed)
+                    return
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    await self.clear_quiet_event_message_record(guild.id)
+                    await self.db.commit()
+
+            try:
+                message = await channel.send(embed=embed)
+            except discord.Forbidden:
+                return
+
+            await self.db.execute(
+                """
+                UPDATE guild_settings
+                SET quiet_event_message_channel_id = ?,
+                    quiet_event_message_id = ?
+                WHERE guild_id = ?
+                """,
+                (channel.id, message.id, guild.id),
+            )
+            await self.db.commit()
+
+    async def delete_quiet_event_end_notice(self, guild: discord.Guild):
+        settings = await self.fetch_guild_settings(guild.id)
+        if not settings or settings.get("quiet_event_until", 0):
+            return
+        if not settings.get("quiet_event_message_id", 0):
+            return
+
+        message = await self.fetch_quiet_event_message(guild, settings)
+        if message:
+            try:
+                await message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        await self.clear_quiet_event_message_record(guild.id)
+        await self.db.commit()
+
     async def announce_lifecycle(self, event_name: str, target_guild: discord.Guild = None):
         guilds = [target_guild] if target_guild else list(self.guilds)
         for guild in guilds:
             if not guild:
                 continue
             if event_name in {"quiet_event_start", "quiet_event_end"}:
-                channel = await self.get_quiet_event_channel(guild)
+                await self.announce_quiet_event(event_name, guild)
+                continue
             else:
                 channel = await self.get_announcement_channel(guild)
             if not channel:
@@ -461,12 +594,6 @@ class LevelBot(commands.Bot):
             elif event_name == "shutdown":
                 embed.title = "🛑 Bot Shutting Down"
                 embed.description = "The leveling bot is going offline for a restart or maintenance."
-            elif event_name == "quiet_event_start":
-                embed.title = "🌙 Quiet Hours XP Event"
-                embed.description = f"Chat has gone quiet, so XP is temporarily boosted to **x{DEFAULT_QUIET_EVENT_MULTIPLIER}** for a little while."
-            elif event_name == "quiet_event_end":
-                embed.title = "🌤️ Quiet Hours XP Event Ended"
-                embed.description = "The temporary quiet-hours XP boost has ended."
             else:
                 continue
 
@@ -1164,6 +1291,8 @@ async def on_message(message):
     current_time = time.time()
     content = (message.content or "").strip()
     is_prefix_command = bool(content) and content.startswith(str(bot.command_prefix))
+
+    await bot.delete_quiet_event_end_notice(message.guild)
 
     await bot.db.execute(
         "UPDATE guild_settings SET last_message_at = ? WHERE guild_id = ?",
