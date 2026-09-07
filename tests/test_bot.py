@@ -80,6 +80,23 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.bot.tree.interaction_check(interaction))
         interaction.response.send_message.assert_awaited_once()
 
+    async def test_interaction_helper_omits_none_optional_payloads(self):
+        from src.support import send_interaction_message
+
+        response = SimpleNamespace(is_done=lambda: False, send_message=AsyncMock())
+        interaction = SimpleNamespace(response=response, followup=SimpleNamespace(send=AsyncMock()))
+        await send_interaction_message(interaction, "ok")
+        kwargs = response.send_message.await_args.kwargs
+        self.assertNotIn("embed", kwargs)
+        self.assertNotIn("view", kwargs)
+
+        response = SimpleNamespace(is_done=lambda: True, send_message=AsyncMock())
+        interaction = SimpleNamespace(response=response, followup=SimpleNamespace(send=AsyncMock()))
+        await send_interaction_message(interaction, "ok")
+        kwargs = interaction.followup.send.await_args.kwargs
+        self.assertNotIn("embed", kwargs)
+        self.assertNotIn("view", kwargs)
+
     async def test_shutdown_survives_discord_failure(self):
         self.bot.announce_lifecycle.side_effect = discord.HTTPException(SimpleNamespace(status=500, reason="test"), "test")
         await self.bot.close()
@@ -288,6 +305,43 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(resolved, forum)
         self.assertTrue(is_forum_channel(resolved))
 
+    async def test_lifecycle_tag_selector_saves_each_required_state(self):
+        from src.operations import LifecycleTagConfigView
+
+        tags = [
+            SimpleNamespace(id=101, name="Questions"),
+            SimpleNamespace(id=102, name="In progress"),
+            SimpleNamespace(id=103, name="Needs reply"),
+            SimpleNamespace(id=104, name="Complete"),
+        ]
+        forum = SimpleNamespace(id=500, available_tags=tags)
+        guild = SimpleNamespace(id=10, get_channel=lambda channel_id: forum if channel_id == forum.id else None)
+        await self.bot.support_store.update_settings(10, forum_channel_id=forum.id)
+        operations = self.bot.get_cog("OperationsCog")
+        operations.audit_action = AsyncMock()
+        view = LifecycleTagConfigView(operations, guild.id, forum, {})
+
+        self.assertEqual(set(view.selectors), {"unanswered", "open", "waiting", "solved"})
+        self.assertEqual(len([child for child in view.children if isinstance(child, discord.ui.Select)]), 4)
+        for state, tag_id in zip(("unanswered", "open", "waiting", "solved"), (101, 102, 103, 104)):
+            view.selected[state] = tag_id
+
+        interaction = SimpleNamespace(
+            guild=guild,
+            user=self.member,
+            response=SimpleNamespace(edit_message=AsyncMock()),
+        )
+        await view.save.callback(interaction)
+        bindings = await self.bot.support_store.get_tag_bindings(10)
+        self.assertEqual({state: binding[0] for state, binding in bindings.items()}, {
+            "unanswered": 101,
+            "open": 102,
+            "waiting": 103,
+            "solved": 104,
+        })
+        self.assertTrue(all(not managed for _tag_id, managed in bindings.values()))
+        interaction.response.edit_message.assert_awaited_once()
+
     async def test_canned_responses_are_isolated_and_case_insensitive(self):
         store = self.bot.support_store
         await store.create_response(10, "welcome", "Welcome to Labworks.", 20)
@@ -311,16 +365,16 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             id = 500
 
             def __init__(self):
-                self.available_tags = [SimpleNamespace(id=1, name="Open")]
-                self.next_id = 10
+                self.available_tags = [
+                    SimpleNamespace(id=1, name="Unanswered"),
+                    SimpleNamespace(id=2, name="Open"),
+                    SimpleNamespace(id=3, name="Waiting for Reply"),
+                    SimpleNamespace(id=4, name="Solved"),
+                ]
+                self.create_tag = AsyncMock(side_effect=AssertionError("forum tags must be selected, not created"))
 
             def get_tag(self, tag_id):
                 return next((tag for tag in self.available_tags if tag.id == tag_id), None)
-
-            async def create_tag(self, *, name, reason):
-                tag = SimpleNamespace(id=self.next_id, name=name)
-                self.next_id += 1
-                return tag
 
         forum = Forum()
         guild = SimpleNamespace(
@@ -333,9 +387,17 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.support_store.update_settings(10, enabled=True, forum_channel_id=forum.id)
         support = self.bot.get_cog("SupportCog")
         bindings, errors = await support.provision_tags(guild)
+        self.assertEqual(bindings, {})
+        self.assertEqual(len(errors), 4)
+        forum.create_tag.assert_not_awaited()
+
+        for state, tag_id in zip(("unanswered", "open", "waiting", "solved"), (1, 2, 3, 4)):
+            await self.bot.support_store.set_tag_binding(10, state, tag_id, False)
+        bindings, errors = await support.provision_tags(guild)
         self.assertFalse(errors)
         self.assertEqual(set(bindings), {"unanswered", "open", "waiting", "solved"})
         self.assertFalse((await self.bot.support_store.get_tag_bindings(10))["open"][1])
+        forum.create_tag.assert_not_awaited()
 
         starter = SimpleNamespace(id=700, author=owner, content="help", created_at=now)
         sent = AsyncMock(return_value=SimpleNamespace(id=900))

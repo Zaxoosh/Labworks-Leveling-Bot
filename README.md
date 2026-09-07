@@ -136,7 +136,7 @@ python src/main.py
 The support workflow is disabled by default for each guild. Administrators configure it through `/config` → **Support Workflow**:
 
 - choose a forum, configure multiple support-staff roles, and set reminder timings;
-- provision or reuse the `Unanswered`, `Open`, `Waiting for Reply`, and `Solved` forum tags;
+- create the forum tags yourself in the forum channel settings, then select one existing tag for each required state (`Unanswered`, `Open`, `Waiting for Reply`, and `Solved`) through the configuration menu; the bot never creates or deletes forum tags;
 - automatically track post replies, prompt incomplete starters once, send persisted reminders, and archive solved/unanswered posts safely;
 - use `/solved`, `/unsolve`, and `/incomplete-post` inside support posts;
 - manage reusable responses with `/tag create`, `/tag use`, `/tag info`, `/tag edit`, and `/tag delete`;

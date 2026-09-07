@@ -905,13 +905,18 @@ class LevelBot(commands.Bot):
                     findings.append("Support workflow is enabled but its forum channel is missing or invalid.")
                 else:
                     bindings = await self.support_store.get_tag_bindings(guild.id)
+                    available_tag_ids = {
+                        int(getattr(tag, "id", 0) or 0)
+                        for tag in getattr(support_forum, "available_tags", ()) or ()
+                        if str(getattr(tag, "id", "")).isdigit()
+                    }
                     missing_states = [
                         CANONICAL_TAG_NAMES[state]
                         for state in ("unanswered", "open", "waiting", "solved")
-                        if state not in bindings
+                        if state not in bindings or bindings[state][0] not in available_tag_ids
                     ]
                     if missing_states:
-                        findings.append("Support lifecycle tags are missing: " + ", ".join(missing_states) + ".")
+                        findings.append("Support lifecycle tags are missing or not selected: " + ", ".join(missing_states) + ".")
                     forum_perms = support_forum.permissions_for(member)
                     for permission in ("view_channel", "send_messages", "embed_links", "manage_threads"):
                         if not getattr(forum_perms, permission, False):

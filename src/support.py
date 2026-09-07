@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
-import re
 import time
 import uuid
 from typing import Any
@@ -35,20 +34,8 @@ CANONICAL_TAG_NAMES = {
     "solved": "Solved",
 }
 
-TAG_ALIASES = {
-    "unanswered": {"unanswered", "unanswered question", "needs answer"},
-    "open": {"open", "in progress", "not solved", "not closed"},
-    "waiting": {"waiting", "waiting for reply", "waiting reply", "awaiting reply", "awaiting response"},
-    "solved": {"solved", "closed", "complete", "completed"},
-}
-
 INCOMPLETE_POST_LIMIT = 40
 REMINDER_LOOP_MINUTES = 15
-
-
-def normalize_tag_name(value: str) -> str:
-    value = re.sub(r"[^a-z0-9]+", " ", str(value).lower())
-    return re.sub(r"\s+", " ", value).strip()
 
 
 def timestamp(value: Any, fallback: float | None = None) -> float:
@@ -74,7 +61,6 @@ def is_forum_channel(channel: Any) -> bool:
     return isinstance(channel, discord.ForumChannel) or getattr(channel, "type", None) == discord.ChannelType.forum or (
         channel is not None
         and hasattr(channel, "available_tags")
-        and hasattr(channel, "create_tag")
     )
 
 
@@ -103,23 +89,23 @@ async def send_interaction_message(
 
     response = interaction.response
     mention_policy = allowed_mentions if allowed_mentions is not None else discord.AllowedMentions.none()
+    payload: dict[str, Any] = {
+        "ephemeral": ephemeral,
+        "allowed_mentions": mention_policy,
+    }
+    # discord.py treats omitted optional values differently from ``None``.
+    # In particular, Webhook.send tries to call ``view.is_finished()`` when
+    # a view argument is present, which made a plain /solved reply fail with
+    # ``NoneType has no attribute is_finished`` after the state change worked.
+    if embed is not None:
+        payload["embed"] = embed
+    if view is not None:
+        payload["view"] = view
     is_done = getattr(response, "is_done", None)
     if callable(is_done) and is_done():
-        await interaction.followup.send(
-            content,
-            embed=embed,
-            view=view,
-            ephemeral=ephemeral,
-            allowed_mentions=mention_policy,
-        )
+        await interaction.followup.send(content, **payload)
     else:
-        await response.send_message(
-            content,
-            embed=embed,
-            view=view,
-            ephemeral=ephemeral,
-            allowed_mentions=mention_policy,
-        )
+        await response.send_message(content, **payload)
 
 
 class ReminderView(ui.View):
@@ -358,90 +344,82 @@ class SupportCog(commands.Cog):
         except (discord.HTTPException, AttributeError, KeyError):
             logger.debug("Could not publish support audit action %s", action, exc_info=True)
 
-    async def provision_tags(self, guild: discord.Guild) -> tuple[dict[str, int], list[str]]:
+    async def validate_tag_bindings(self, guild: discord.Guild) -> tuple[dict[str, int], list[str]]:
+        """Validate the administrator's existing forum-tag selections.
+
+        Forum tags are deliberately never created, renamed, or deleted here.
+        The administrator selects one existing tag for each lifecycle state in
+        the support configuration view; this method only verifies those saved
+        IDs still belong to the configured forum.
+        """
+
         async with self._tag_provision_lock:
-            return await self._provision_tags(guild)
+            settings = await self.store.get_settings(guild.id)
+            forum = self.forum_for_settings(guild, settings)
+            if forum is None:
+                return {}, ["Choose a forum channel before selecting lifecycle tags."]
 
-    async def _provision_tags(self, guild: discord.Guild) -> tuple[dict[str, int], list[str]]:
-        settings = await self.store.get_settings(guild.id)
-        forum = self.forum_for_settings(guild, settings)
-        if forum is None:
-            return {}, ["Choose a forum channel before provisioning lifecycle tags."]
+            # Refresh the channel when the guild exposes the API helper so a
+            # deleted or newly selected tag is not hidden by a stale cache.
+            fetch_channel = getattr(guild, "fetch_channel", None)
+            if callable(fetch_channel):
+                try:
+                    refreshed = await fetch_channel(forum.id)
+                    if is_forum_channel(refreshed):
+                        forum = refreshed
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
 
-        bindings = await self.store.get_tag_bindings(guild.id)
-        resolved: dict[str, int] = {}
-        errors: list[str] = []
-        available = list(getattr(forum, "available_tags", ()) or ())
-
-        for state in SUPPORT_STATES:
-            existing_binding = bindings.get(state)
-            if existing_binding:
-                bound = next((tag for tag in available if int(getattr(tag, "id", 0)) == existing_binding[0]), None)
-                bound = bound or self._tag_cache.get((guild.id, existing_binding[0]))
-                verified_from_discord = False
-                if bound is None:
-                    fetch_channel = getattr(guild, "fetch_channel", None)
-                    if callable(fetch_channel):
-                        try:
-                            refreshed = await fetch_channel(forum.id)
-                            if is_forum_channel(refreshed):
-                                verified_from_discord = True
-                                forum = refreshed
-                                available = list(getattr(forum, "available_tags", ()) or ())
-                                bound = next(
-                                    (tag for tag in available if int(getattr(tag, "id", 0)) == existing_binding[0]),
-                                    None,
-                                )
-                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                            pass
-                if bound is not None:
-                    resolved[state] = existing_binding[0]
-                    self._tag_cache[(guild.id, existing_binding[0])] = bound
+            bindings = await self.store.get_tag_bindings(guild.id)
+            available: dict[int, Any] = {}
+            for tag in getattr(forum, "available_tags", ()) or ():
+                try:
+                    tag_id = int(getattr(tag, "id", 0) or 0)
+                except (TypeError, ValueError):
                     continue
-                if not verified_from_discord:
+                if tag_id > 0:
+                    available[tag_id] = tag
+
+            resolved: dict[str, int] = {}
+            errors: list[str] = []
+            states_by_tag: dict[int, str] = {}
+            for state in SUPPORT_STATES:
+                existing_binding = bindings.get(state)
+                if not existing_binding:
+                    errors.append(f"Select an existing forum tag for {CANONICAL_TAG_NAMES[state]}.")
+                    continue
+                try:
+                    tag_id = int(existing_binding[0])
+                except (TypeError, ValueError):
+                    tag_id = 0
+                tag = available.get(tag_id)
+                if tag_id <= 0 or tag is None:
                     errors.append(
-                        f"Could not verify the stored {CANONICAL_TAG_NAMES[state]} tag binding; refusing to create a duplicate."
+                        f"The selected {CANONICAL_TAG_NAMES[state]} tag is missing from the configured forum; choose it again."
                     )
                     continue
-
-            aliases = TAG_ALIASES[state] | {normalize_tag_name(CANONICAL_TAG_NAMES[state])}
-            matches = [tag for tag in available if normalize_tag_name(getattr(tag, "name", "")) in aliases]
-            if len(matches) > 1:
-                errors.append(
-                    f"{CANONICAL_TAG_NAMES[state]} has multiple matching forum tags; rename or remove the duplicate manually."
-                )
-                continue
-            if matches:
-                tag = matches[0]
-                tag_id = int(getattr(tag, "id", 0) or 0)
-                if tag_id <= 0:
-                    errors.append(f"The existing {CANONICAL_TAG_NAMES[state]} tag has no usable ID.")
+                previous_state = states_by_tag.get(tag_id)
+                if previous_state is not None:
+                    errors.append(
+                        f"The same forum tag cannot be used for both {CANONICAL_TAG_NAMES[previous_state]} and "
+                        f"{CANONICAL_TAG_NAMES[state]}; choose a different tag."
+                    )
                     continue
+                states_by_tag[tag_id] = state
                 resolved[state] = tag_id
                 self._tag_cache[(guild.id, tag_id)] = tag
-                await self.store.set_tag_binding(guild.id, state, tag_id, False)
-                continue
 
-            if len(available) >= 20:
-                errors.append(f"No tag is available for {CANONICAL_TAG_NAMES[state]} and Discord's 20-tag limit is full.")
-                continue
-            try:
-                tag = await forum.create_tag(
-                    name=CANONICAL_TAG_NAMES[state],
-                    reason="Provision Labworks support lifecycle tags",
-                )
-                tag_id = int(getattr(tag, "id", 0) or 0)
-                if tag_id <= 0:
-                    errors.append(f"Discord returned no usable ID for {CANONICAL_TAG_NAMES[state]}.")
-                    continue
-                available.append(tag)
-                resolved[state] = tag_id
-                self._tag_cache[(guild.id, tag_id)] = tag
-                await self.store.set_tag_binding(guild.id, state, tag_id, True)
-            except (discord.Forbidden, discord.HTTPException) as error:
-                errors.append(f"Could not create {CANONICAL_TAG_NAMES[state]}: {error.__class__.__name__}.")
+            return resolved, errors
 
-        return resolved, errors
+    async def provision_tags(self, guild: discord.Guild) -> tuple[dict[str, int], list[str]]:
+        """Backward-compatible name for tag validation.
+
+        Older callers used ``provision_tags`` during enablement. Keeping the
+        method avoids breaking those callers while ensuring it can no longer
+        mutate Discord forum tags or create anything automatically.
+        """
+
+        return await self.validate_tag_bindings(guild)
 
     async def _tag_object(self, thread: Any, tag_id: int) -> Any | None:
         guild = getattr(thread, "guild", None)
@@ -468,10 +446,10 @@ class SupportCog(commands.Cog):
         cached = self._tag_cache.get((guild.id, int(tag_id)))
         if cached is not None:
             return cached
-        # A ForumTag returned by create_tag is not guaranteed to be added to
-        # the channel cache immediately. The ID is still the authoritative
-        # value Discord needs for Thread.edit; use a lightweight object until
-        # the next channel refresh.
+        # A configured ForumTag is not guaranteed to be present in every
+        # channel cache immediately. The ID is still the authoritative value
+        # Discord needs for Thread.edit; use a lightweight object until the
+        # next channel refresh.
         bindings = await self.store.get_tag_bindings(guild.id)
         state = next((state for state, (bound_id, _managed) in bindings.items() if bound_id == int(tag_id)), None)
         if state is None:

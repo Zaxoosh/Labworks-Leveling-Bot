@@ -25,10 +25,10 @@ try:  # Works both as ``python src/main.py`` and package imports in tests.
         is_forum_channel,
         send_interaction_message,
     )
-    from .support_store import CannedResponse, SupportSettings, SupportStore
+    from .support_store import SUPPORT_STATES, CannedResponse, SupportSettings, SupportStore
 except ImportError:  # pragma: no cover - exercised by the production entrypoint.
     from support import CANONICAL_TAG_NAMES, SupportCog, is_forum_channel, send_interaction_message
-    from support_store import CannedResponse, SupportSettings, SupportStore
+    from support_store import SUPPORT_STATES, CannedResponse, SupportSettings, SupportStore
 
 
 logger = logging.getLogger(__name__)
@@ -251,6 +251,141 @@ class SupportTimerModal(ui.Modal):
         await send_interaction_message(interaction, "✅ Support reminder timings updated.")
 
 
+class LifecycleTagConfigView(ui.View):
+    """Let an administrator map each support state to an existing forum tag."""
+
+    def __init__(
+        self,
+        cog: "OperationsCog",
+        guild_id: int,
+        forum: Any,
+        existing_bindings: dict[str, tuple[int, bool]],
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild_id = int(guild_id)
+        self.forum_id = int(forum.id)
+        self.selected: dict[str, int] = {}
+        self.selectors: dict[str, ui.Select] = {}
+        self.tags_by_id: dict[int, Any] = {}
+
+        for tag in getattr(forum, "available_tags", ()) or ():
+            try:
+                tag_id = int(getattr(tag, "id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if tag_id > 0:
+                self.tags_by_id[tag_id] = tag
+
+        for state in SUPPORT_STATES:
+            current = existing_bindings.get(state)
+            current_id = int(current[0]) if current else 0
+            if current_id in self.tags_by_id:
+                self.selected[state] = current_id
+            options = [
+                discord.SelectOption(
+                    label=str(getattr(tag, "name", "Forum tag"))[:100] or f"Forum tag {tag_id}",
+                    value=str(tag_id),
+                    default=tag_id == current_id,
+                )
+                for tag_id, tag in self.tags_by_id.items()
+            ]
+            selector = ui.Select(
+                placeholder=f"Select tag for {CANONICAL_TAG_NAMES[state]}…",
+                options=options,
+                min_values=1,
+                max_values=1,
+            )
+            selector.callback = self._selection_callback(state, selector)
+            self.selectors[state] = selector
+            self.add_item(selector)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or int(interaction.guild.id) != self.guild_id:
+            await send_interaction_message(interaction, "This tag configuration belongs to a different server.")
+            return False
+        return await require_admin(interaction)
+
+    def _selection_callback(self, state: str, selector: ui.Select):
+        async def callback(interaction: discord.Interaction) -> None:
+            try:
+                tag_id = int(selector.values[0])
+            except (IndexError, TypeError, ValueError):
+                await send_interaction_message(interaction, "Choose one existing forum tag.")
+                return
+            tag = self.tags_by_id.get(tag_id)
+            if tag is None:
+                await send_interaction_message(interaction, "That forum tag is no longer available; reopen this selector and try again.")
+                return
+            self.selected[state] = tag_id
+            await send_interaction_message(
+                interaction,
+                f"✅ **{CANONICAL_TAG_NAMES[state]}** will use **{getattr(tag, 'name', 'the selected tag')}**. Click **Save tag selections** when all four are set.",
+            )
+
+        return callback
+
+    @ui.button(label="Save tag selections", style=discord.ButtonStyle.success, emoji="💾", row=4)
+    async def save(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        forum = await self.cog.get_configured_forum(interaction.guild)
+        if forum is None or int(getattr(forum, "id", 0)) != self.forum_id:
+            await send_interaction_message(interaction, "The configured support forum is unavailable. Choose the forum again, then reselect the lifecycle tags.")
+            return
+
+        available: dict[int, Any] = {}
+        for tag in getattr(forum, "available_tags", ()) or ():
+            try:
+                tag_id = int(getattr(tag, "id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if tag_id > 0:
+                available[tag_id] = tag
+
+        selections: dict[str, tuple[int, Any]] = {}
+        errors: list[str] = []
+        for state in SUPPORT_STATES:
+            tag_id = self.selected.get(state)
+            tag = available.get(tag_id) if tag_id is not None else None
+            if tag is None:
+                errors.append(f"Select an existing forum tag for {CANONICAL_TAG_NAMES[state]}.")
+            else:
+                selections[state] = (tag_id, tag)
+
+        states_by_tag: dict[int, str] = {}
+        for state, (tag_id, _tag) in selections.items():
+            previous_state = states_by_tag.get(tag_id)
+            if previous_state is not None:
+                errors.append(
+                    f"The same forum tag cannot be used for both {CANONICAL_TAG_NAMES[previous_state]} and "
+                    f"{CANONICAL_TAG_NAMES[state]}; choose a different tag."
+                )
+            else:
+                states_by_tag[tag_id] = state
+
+        if errors:
+            await send_interaction_message(interaction, "❌ Tag selections were not saved:\n" + "\n".join(errors))
+            return
+
+        for state, (tag_id, tag) in selections.items():
+            await self.cog.store.set_tag_binding(self.guild_id, state, tag_id, False)
+            self.cog.support._tag_cache[(self.guild_id, tag_id)] = tag
+        await self.cog.audit_action(
+            interaction.guild,
+            "support_tags_configured",
+            actor_id=interaction.user.id,
+            details=";".join(f"{state}={tag_id}" for state, (tag_id, _tag) in selections.items()),
+        )
+        lines = [
+            f"`{CANONICAL_TAG_NAMES[state]}` → **{getattr(tag, 'name', 'Forum tag')}**"
+            for state, (_tag_id, tag) in selections.items()
+        ]
+        self.stop()
+        await interaction.response.edit_message(
+            content="✅ Lifecycle tag selections saved.\n" + "\n".join(lines),
+            view=None,
+        )
+
+
 class SupportConfigView(ui.View):
     def __init__(self, cog: "OperationsCog"):
         super().__init__(timeout=300)
@@ -262,7 +397,7 @@ class SupportConfigView(ui.View):
                 discord.SelectOption(label="Forum channel", value="forum", emoji="🧵"),
                 discord.SelectOption(label="Staff roles", value="roles", emoji="🛡️"),
                 discord.SelectOption(label="Reminder timings", value="timings", emoji="⏱️"),
-                discord.SelectOption(label="Provision lifecycle tags", value="provision", emoji="🏷️"),
+                discord.SelectOption(label="Select lifecycle tags", value="provision", emoji="🏷️"),
                 discord.SelectOption(label="Enable support workflow", value="enable", emoji="✅"),
                 discord.SelectOption(label="Disable support workflow", value="disable", emoji="⏸️"),
             ],
@@ -324,9 +459,7 @@ class SupportConfigView(ui.View):
         elif value == "timings":
             await interaction.response.send_modal(SupportTimerModal(self.cog, await self.cog.store.get_settings(interaction.guild.id)))
         elif value == "provision":
-            bindings, errors = await self.cog.support.provision_tags(interaction.guild)
-            await self.cog.audit_action(interaction.guild, "support_tags_provisioned", actor_id=interaction.user.id, details=f"bound={len(bindings)}")
-            await send_interaction_message(interaction, self.cog.format_provision_result(bindings, errors))
+            await self.cog.send_lifecycle_tag_config(interaction)
         elif value == "enable":
             await self.cog.enable_support(interaction)
         elif value == "disable":
@@ -436,6 +569,48 @@ class OperationsCog(commands.Cog):
             return None
         return channel
 
+    async def get_configured_forum(self, guild: discord.Guild) -> Any | None:
+        """Return the configured forum with its current available tags."""
+
+        settings = await self.store.get_settings(guild.id)
+        channel_id = settings.forum_channel_id
+        if not channel_id:
+            return None
+        get_channel = getattr(guild, "get_channel", None)
+        channel = get_channel(channel_id) if callable(get_channel) else None
+        if channel is not None and is_forum_channel(channel) and hasattr(channel, "available_tags"):
+            return channel
+
+        fetch_channel = getattr(guild, "fetch_channel", None)
+        if callable(fetch_channel):
+            try:
+                fetched = await fetch_channel(channel_id)
+                if is_forum_channel(fetched):
+                    return fetched
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
+        return channel if is_forum_channel(channel) else None
+
+    async def send_lifecycle_tag_config(self, interaction: discord.Interaction) -> None:
+        forum = await self.get_configured_forum(interaction.guild)
+        if forum is None:
+            await send_interaction_message(interaction, "Choose a support forum before selecting lifecycle tags.")
+            return
+        tags = list(getattr(forum, "available_tags", ()) or ())
+        if not tags:
+            await send_interaction_message(
+                interaction,
+                "No existing forum tags are available. Create the tags manually in the forum's channel settings, then open this menu again.",
+            )
+            return
+        bindings = await self.store.get_tag_bindings(interaction.guild.id)
+        view = LifecycleTagConfigView(self, interaction.guild.id, forum, bindings)
+        await send_interaction_message(
+            interaction,
+            "Select one existing forum tag for each required lifecycle state, then click **Save tag selections**. The bot will not create or delete forum tags.",
+            view=view,
+        )
+
     async def member_is_staff_or_admin(self, interaction: discord.Interaction, *, allow_public: bool = False) -> bool:
         if interaction.guild is None:
             return False
@@ -460,8 +635,8 @@ class OperationsCog(commands.Cog):
         if errors:
             lines.extend(f"❌ {error}" for error in errors)
         if not lines:
-            return "❌ No lifecycle tags were bound."
-        prefix = "⚠️ Lifecycle tag bindings (action required):" if errors else "✅ Lifecycle tag bindings:"
+            return "❌ No lifecycle tags are selected."
+        prefix = "⚠️ Lifecycle tag selections (action required):" if errors else "✅ Lifecycle tag selections:"
         return prefix + "\n" + "\n".join(lines)
 
     async def send_support_config(self, interaction: discord.Interaction, *, include_view: bool = True) -> None:
@@ -474,10 +649,14 @@ class OperationsCog(commands.Cog):
             (interaction.guild.get_role(role_id).mention if interaction.guild.get_role(role_id) else f"`{role_id}`")
             for role_id in sorted(roles)
         ) or "Administrators only"
-        tags_text = ", ".join(f"{CANONICAL_TAG_NAMES.get(state, state)}=`{tag_id}`" for state, (tag_id, _managed) in bindings.items()) or "Not provisioned"
+        tags_text = ", ".join(
+            f"{CANONICAL_TAG_NAMES[state]}=`{bindings[state][0]}`"
+            for state in SUPPORT_STATES
+            if state in bindings
+        ) or "None selected"
         embed = discord.Embed(
             title="🧵 Support workflow",
-            description="Opt-in forum lifecycle automation for Labworks. Existing forum tags are reused where unambiguous; missing canonical tags can be created.",
+            description="Opt-in forum lifecycle automation for Labworks. Select one existing forum tag for each lifecycle state; the bot never creates or deletes forum tags.",
             color=discord.Color.blurple(),
         )
         embed.add_field(name="Status", value="✅ Enabled" if settings.enabled else "⏸️ Disabled", inline=True)
@@ -498,14 +677,14 @@ class OperationsCog(commands.Cog):
         await send_interaction_message(interaction, "", embed=embed, view=SupportConfigView(self) if include_view else None)
 
     async def enable_support(self, interaction: discord.Interaction) -> None:
-        bindings, errors = await self.support.provision_tags(interaction.guild)
+        bindings, errors = await self.support.validate_tag_bindings(interaction.guild)
         if errors or len(bindings) != 4:
             await send_interaction_message(
                 interaction,
-                "❌ Support workflow remains disabled until the forum and all four lifecycle tags are ready.\n" + self.format_provision_result(bindings, errors),
+                "❌ Support workflow remains disabled until you select four existing lifecycle tags.\n" + self.format_provision_result(bindings, errors),
             )
             return
-        forum = interaction.guild.get_channel((await self.store.get_settings(interaction.guild.id)).forum_channel_id)
+        forum = await self.get_configured_forum(interaction.guild)
         missing: list[str] = []
         me = getattr(interaction.guild, "me", None)
         if forum is None:
