@@ -1,0 +1,14 @@
+.git
+.env
+**/.env
+*.env
+**/__pycache__
+**/*.pyc
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.csv
+data
+backups
+.local
+.venv

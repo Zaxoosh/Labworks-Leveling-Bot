@@ -9,11 +9,55 @@ import datetime
 import asyncio
 import io
 import math
-import secrets
-import string
+import logging
+import json
+import shutil
+import sqlite3
 from pathlib import Path
 from dotenv import load_dotenv
-from aiohttp import web
+
+try:  # Package imports are used by the test suite.
+    from .support import CANONICAL_TAG_NAMES, SupportCog, is_forum_channel
+    from .support_store import SupportStore
+    from .operations import OperationsCog
+except ImportError:  # The Docker entrypoint runs this file directly.
+    from support import CANONICAL_TAG_NAMES, SupportCog, is_forum_channel
+    from support_store import SupportStore
+    from operations import OperationsCog
+
+logger = logging.getLogger(__name__)
+
+
+def finite_multiplier(value):
+    multiplier = float(value)
+    if not math.isfinite(multiplier) or not 1.0 <= multiplier <= 100.0:
+        raise ValueError("Multiplier must be between 1 and 100.")
+    return multiplier
+
+
+class GuildCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message("Use this command in a server.", ephemeral=True)
+            return False
+        return True
+
+
+async def check_admin_interaction(interaction):
+    if interaction.guild and interaction.permissions.administrator:
+        return True
+    await interaction.response.send_message("🚫 Administrator permission is required.", ephemeral=True)
+    return False
+
+
+class AdminView(ui.View):
+    async def interaction_check(self, interaction):
+        return await check_admin_interaction(interaction)
+
+
+class AdminModal(ui.Modal):
+    async def interaction_check(self, interaction):
+        return await check_admin_interaction(interaction)
 
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
@@ -28,9 +72,22 @@ load_dotenv(APP_DIR / ".env", override=False)
 
 TEST_GUILD_ID = 1041046184552308776
 TEST_GUILD = discord.Object(id=TEST_GUILD_ID)
+
+
+def configured_sync_guilds():
+    """Return explicit development sync targets, retaining the legacy default."""
+    raw_ids = os.getenv("LABWORKS_SYNC_GUILD_IDS", "")
+    if not raw_ids.strip():
+        return [TEST_GUILD]
+    targets = []
+    for raw_id in raw_ids.split(","):
+        raw_id = raw_id.strip()
+        if raw_id.isdigit() and int(raw_id) > 0:
+            targets.append(discord.Object(id=int(raw_id)))
+    return targets or [TEST_GUILD]
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = Path(os.getenv("LEVELBOT_DATA_DIR", "/data" if Path("/data").is_dir() else str(PROJECT_ROOT / "data")))
 RANK_CARD_DIR = DATA_DIR / "rank_cards"
 ASSETS_DIR = PROJECT_ROOT / "assets"
 FONT_DIR = ASSETS_DIR / "fonts"
@@ -39,19 +96,30 @@ DEFAULT_QUIET_EVENT_MIN_SILENCE = 45 * 60
 DEFAULT_QUIET_EVENT_DURATION = 20 * 60
 DEFAULT_QUIET_EVENT_COOLDOWN = 3 * 60 * 60
 VOICE_XP_PER_MINUTE = 10
+BACKUP_INTERVAL_HOURS = 6
+BACKUP_RETENTION = 14
+SCHEDULED_SALARY_GRACE_SECONDS = 3600
 GITHUB_SPONSORS_URL = "https://github.com/sponsors/Zaxoosh"
 SPONSOR_PROMO_LINES = [
     "Sponsor from $2/mo for an XP boost, sponsor role, and access to the Sponsor Lounge.",
     "Sponsor from $5/mo to add a passive XP salary and voting power on future updates.",
     "Studio Partner sponsorship adds rank-card flair, rebirth perks, and stronger gifting perks.",
 ]
-MINECRAFT_API_HOST = os.getenv("MINECRAFT_API_HOST", "0.0.0.0")
-MINECRAFT_API_PORT = int(os.getenv("MINECRAFT_API_PORT", "8095"))
-MINECRAFT_API_TOKEN = os.getenv("MINECRAFT_API_TOKEN", "")
-MINECRAFT_DAILY_XP_CAP = int(os.getenv("MINECRAFT_DAILY_XP_CAP", "1500"))
-MINECRAFT_LINK_CODE_TTL_SECONDS = int(os.getenv("MINECRAFT_LINK_CODE_TTL_SECONDS", "900"))
-MINECRAFT_TARGET_GUILD_ID = int(os.getenv("MINECRAFT_TARGET_GUILD_ID", "0") or 0)
-MINECRAFT_ANNOUNCE_ENABLED = os.getenv("MINECRAFT_ANNOUNCE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+ACHIEVEMENTS = (
+    ("first_steps", "First Steps", "Send your first message.", "messages", 1, 25),
+    ("chatty", "Chatty", "Send 100 messages.", "messages", 100, 100),
+    ("xp_hunter", "XP Hunter", "Earn 10,000 lifetime XP.", "lifetime_xp", 10000, 500),
+    ("level_50", "Rising Star", "Reach level 50.", "level", 50, 250),
+    ("voice_regular", "Voice Regular", "Spend 60 minutes in eligible voice chat.", "voice_minutes", 60, 150),
+    ("first_rebirth", "Prestige", "Complete your first rebirth.", "rebirth", 1, 1000),
+)
+
+WEEKLY_CHALLENGE_TEMPLATES = (
+    ("messages", "Conversation Starter", "Send {target} messages this week.", 50, 250),
+    ("xp", "XP Sprint", "Earn {target} XP this week.", 1000, 300),
+    ("voice_minutes", "Voice Regular", "Spend {target} minutes in eligible voice chat this week.", 30, 300),
+)
 
 
 def resolve_database_path():
@@ -133,13 +201,20 @@ class LevelBot(commands.Bot):
         intents.message_content = True
         intents.voice_states = True
         intents.members = True 
-        super().__init__(command_prefix='!', intents=intents)
+        super().__init__(
+            command_prefix='!', intents=intents, tree_cls=GuildCommandTree,
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False),
+        )
+        self.xp_lock = asyncio.Lock()
+        self.achievement_lock = asyncio.Lock()
+        self.db_lock = asyncio.Lock()
         self.db_path = DATABASE_PATH
         self.start_time = datetime.datetime.now(datetime.timezone.utc)
         self.ready_announced = False
         self.current_lifecycle_state = "starting"
-        self.minecraft_api_runner = None
-        self.minecraft_api_site = None
+        self.support_store = None
+        self.support_cog = None
+        self.operations_cog = None
         
     async def setup_hook(self):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -147,13 +222,16 @@ class LevelBot(commands.Bot):
         FONT_DIR.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = await aiosqlite.connect(self.db_path.as_posix())
+        self.support_store = SupportStore(self)
+        await self.support_store.ensure_schema()
 
         # TABLES
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER, 
                 guild_id INTEGER, 
-                xp INTEGER DEFAULT 0, 
+                xp INTEGER DEFAULT 0,
+                lifetime_xp INTEGER DEFAULT 0,
                 weekly_xp INTEGER DEFAULT 0,
                 monthly_xp INTEGER DEFAULT 0,
                 message_count INTEGER DEFAULT 0,
@@ -177,9 +255,6 @@ class LevelBot(commands.Bot):
                 global_xp_mult REAL DEFAULT 1.0,
                 audit_channel_id INTEGER DEFAULT 0,
                 status_channel_id INTEGER DEFAULT 0,
-                minecraft_announce_channel_id INTEGER DEFAULT 0,
-                minecraft_announce_enabled INTEGER DEFAULT 0,
-                minecraft_daily_xp_cap INTEGER DEFAULT 1500,
                 quiet_event_until REAL DEFAULT 0,
                 quiet_event_multiplier REAL DEFAULT 1.0,
                 last_message_at REAL DEFAULT 0,
@@ -197,36 +272,70 @@ class LevelBot(commands.Bot):
         await self.db.execute("CREATE TABLE IF NOT EXISTS sponsors (user_id INTEGER, guild_id INTEGER, tier_name TEXT, PRIMARY KEY (user_id, guild_id))")
         await self.db.execute("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
         await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS minecraft_links (
-                minecraft_uuid TEXT PRIMARY KEY,
-                minecraft_name TEXT,
-                discord_id INTEGER UNIQUE,
-                linked_at TIMESTAMP
-            )
-        """)
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS minecraft_link_codes (
-                code TEXT PRIMARY KEY,
-                discord_id INTEGER UNIQUE,
+            CREATE TABLE IF NOT EXISTS salary_runs (
                 guild_id INTEGER,
-                expires_at REAL,
-                created_at REAL
+                period_key TEXT,
+                started_at REAL NOT NULL,
+                completed_at REAL,
+                status TEXT NOT NULL DEFAULT 'running',
+                users_paid INTEGER DEFAULT 0,
+                total_xp INTEGER DEFAULT 0,
+                PRIMARY KEY (guild_id, period_key)
             )
         """)
         await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS minecraft_xp_events (
+            CREATE TABLE IF NOT EXISTS activity_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                minecraft_uuid TEXT,
-                discord_id INTEGER,
-                event_type TEXT,
-                event_key TEXT,
-                xp_awarded INTEGER,
-                created_at TIMESTAMP
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER,
+                activity_type TEXT NOT NULL,
+                amount INTEGER DEFAULT 0,
+                details TEXT DEFAULT '',
+                created_at REAL NOT NULL
             )
         """)
         await self.db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_minecraft_xp_events_idempotency
-            ON minecraft_xp_events (minecraft_uuid, event_type, event_key)
+            CREATE TABLE IF NOT EXISTS achievements (
+                achievement_key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                target INTEGER NOT NULL,
+                reward_xp INTEGER NOT NULL
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS user_achievements (
+                user_id INTEGER,
+                guild_id INTEGER,
+                achievement_key TEXT,
+                unlocked_at REAL NOT NULL,
+                PRIMARY KEY (user_id, guild_id, achievement_key)
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_challenges (
+                guild_id INTEGER,
+                week_key TEXT,
+                challenge_key TEXT,
+                metric TEXT NOT NULL DEFAULT 'messages',
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                target INTEGER NOT NULL,
+                reward_xp INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, week_key)
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS challenge_progress (
+                user_id INTEGER,
+                guild_id INTEGER,
+                week_key TEXT,
+                challenge_key TEXT,
+                progress INTEGER NOT NULL DEFAULT 0,
+                completed_at REAL,
+                PRIMARY KEY (user_id, guild_id, week_key, challenge_key)
+            )
         """)
 
         await self.ensure_column(
@@ -270,25 +379,27 @@ class LevelBot(commands.Bot):
             "INTEGER DEFAULT 0",
         )
         await self.ensure_column(
-            "guild_settings",
-            "minecraft_announce_channel_id",
-            "INTEGER DEFAULT 0",
-        )
-        await self.ensure_column(
-            "guild_settings",
-            "minecraft_announce_enabled",
-            "INTEGER DEFAULT 0",
-        )
-        await self.ensure_column(
-            "guild_settings",
-            "minecraft_daily_xp_cap",
-            f"INTEGER DEFAULT {MINECRAFT_DAILY_XP_CAP}",
-        )
-        await self.ensure_column(
             "users",
             "voice_minutes",
             "INTEGER DEFAULT 0",
         )
+        await self.ensure_column(
+            "users",
+            "lifetime_xp",
+            "INTEGER DEFAULT 0",
+        )
+        await self.migrate_legacy_lifetime_xp()
+        await self.ensure_column(
+            "weekly_challenges",
+            "metric",
+            "TEXT NOT NULL DEFAULT 'messages'",
+        )
+
+        await self.db.executemany(
+            "INSERT OR IGNORE INTO achievements (achievement_key, name, description, metric, target, reward_xp) VALUES (?, ?, ?, ?, ?, ?)",
+            ACHIEVEMENTS,
+        )
+        await self.db.commit()
 
         previous_clean_shutdown = (await self.get_meta("clean_shutdown", "1")) == "1"
         previous_heartbeat = float(await self.get_meta("last_heartbeat", "0") or 0)
@@ -296,7 +407,30 @@ class LevelBot(commands.Bot):
 
         await self.set_meta("clean_shutdown", "0")
         await self.set_meta("last_startup_at", str(time.time()))
+        await self.reconcile_periodic_stats()
         await self.db.commit()
+        try:
+            await self.backup_database("startup")
+        except Exception:
+            logger.exception("Startup database backup failed")
+
+        existing_support = self.get_cog("SupportCog")
+        if existing_support is None:
+            self.support_cog = SupportCog(self, self.support_store)
+            self.operations_cog = OperationsCog(self, self.support_store, self.support_cog)
+            await self.add_cog(self.support_cog)
+            await self.add_cog(self.operations_cog)
+        else:
+            # A few administrative workflows reopen the same bot object in
+            # tests and local tooling. Rebind the repositories to the new
+            # SQLite connection and restart only the support worker.
+            self.support_cog = existing_support
+            self.support_cog.store = self.support_store
+            self.operations_cog = self.get_cog("OperationsCog")
+            if self.operations_cog is not None:
+                self.operations_cog.store = self.support_store
+                self.operations_cog.support = self.support_cog
+        self.support_cog.start_reminder_loop()
         
         self.voice_xp_loop.start()
         self.presence_xp_loop.start()
@@ -305,29 +439,50 @@ class LevelBot(commands.Bot):
         self.quiet_event_loop.start()
         self.heartbeat_loop.start()
         self.presence_refresh_loop.start()
+        self.backup_loop.start()
 
-        if MINECRAFT_API_TOKEN:
-            await self.start_minecraft_api()
-        else:
-            print("Minecraft API disabled: set MINECRAFT_API_TOKEN to enable it.")
 
-        self.tree.copy_global_to(guild=TEST_GUILD)
-        await self.tree.sync(guild=TEST_GUILD)
+        for sync_guild in configured_sync_guilds():
+            self.tree.copy_global_to(guild=sync_guild)
+            await self.tree.sync(guild=sync_guild)
         print(f"✅ Bot Online & Synced ({self.db_path})")
         self.previous_clean_shutdown = previous_clean_shutdown
         self.previous_heartbeat = previous_heartbeat
 
     async def close(self):
-        if hasattr(self, "db"):
-            await self.announce_lifecycle("shutdown")
-            await self.set_meta("clean_shutdown", "1")
-            await self.set_meta("last_shutdown_at", str(time.time()))
-            await self.db.commit()
-        if self.minecraft_api_runner:
-            await self.minecraft_api_runner.cleanup()
-        if hasattr(self, "db"):
-            await self.db.close()
-        await super().close()
+        # Stop writers before closing their shared database connection.
+        pending = []
+        if self.support_cog is not None:
+            loop = self.support_cog.reminder_loop
+            task = loop.get_task()
+            loop.cancel()
+            if task and task is not asyncio.current_task():
+                pending.append(task)
+        for name in ("voice_xp_loop", "presence_xp_loop", "birthday_loop", "reset_stats_loop",
+                     "quiet_event_loop", "heartbeat_loop", "presence_refresh_loop", "backup_loop"):
+            loop = getattr(self, name)
+            task = loop.get_task()
+            loop.cancel()
+            if task and task is not asyncio.current_task():
+                pending.append(task)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        try:
+            if hasattr(self, "db"):
+                try:
+                    await self.announce_lifecycle("shutdown")
+                except discord.HTTPException:
+                    logger.warning("Could not announce shutdown", exc_info=True)
+                await self.set_meta("clean_shutdown", "1")
+                await self.set_meta("last_shutdown_at", str(time.time()))
+                await self.db.commit()
+        finally:
+            try:
+                if hasattr(self, "db"):
+                    await self.db.close()
+                    del self.db
+            finally:
+                await super().close()
 
     async def ensure_column(self, table_name, column_name, column_sql):
         async with self.db.execute(f"PRAGMA table_info({table_name})") as cursor:
@@ -346,6 +501,98 @@ class LevelBot(commands.Bot):
             (key, str(value)),
         )
 
+    async def migrate_legacy_lifetime_xp(self):
+        """Backfill lifetime XP from the level state created by the old schema.
+
+        Before lifetime_xp existed, users.xp held the current-level remainder.
+        Copying that remainder directly into lifetime_xp made older users look
+        artificially low on the all-time leaderboard. Users with a pre-existing
+        rebirth cannot be reconstructed without historical XP events, so their
+        existing counter is preserved and future awards continue accumulating.
+        """
+        migration_key = "lifetime_xp_backfill_v2"
+        if await self.get_meta(migration_key):
+            return 0
+
+        async with self.db.execute(
+            "SELECT user_id, guild_id, xp, level, rebirth FROM users"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        updates = []
+        for user_id, guild_id, xp, level, rebirth in rows:
+            if int(rebirth or 0) > 0:
+                # Rebirth history was not stored by the legacy schema. Keep any
+                # counter already accumulated rather than inventing a total.
+                continue
+            corrected_total = total_xp_for_state(int(level or 1), int(xp or 0))
+            updates.append((corrected_total, user_id, guild_id))
+
+        if updates:
+            await self.db.executemany(
+                "UPDATE users SET lifetime_xp = ? WHERE user_id = ? AND guild_id = ?",
+                updates,
+            )
+        await self.set_meta(migration_key, datetime.datetime.now(datetime.timezone.utc).isoformat())
+        return len(updates)
+
+    async def backup_database(self, reason="scheduled"):
+        """Create a consistent SQLite backup and retain a bounded rollback set."""
+        backup_dir = DATA_DIR / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        destination = backup_dir / f"levels-{stamp}-{reason}.db"
+        temporary = destination.with_suffix(".tmp")
+        await self.db.commit()
+
+        source = sqlite3.connect(self.db_path.as_posix())
+        target = sqlite3.connect(temporary.as_posix())
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        temporary.replace(destination)
+
+        backups = sorted(backup_dir.glob("levels-*.db"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for stale in backups[BACKUP_RETENTION:]:
+            stale.unlink(missing_ok=True)
+        await self.set_meta("last_backup_at", str(time.time()))
+        await self.set_meta("last_backup_path", destination.name)
+        await self.db.commit()
+        return destination
+
+    async def restore_database(self, backup_path):
+        """Restore a validated backup while the bot is stopped by an operator."""
+        backup = Path(backup_path).resolve()
+        backup_root = (DATA_DIR / "backups").resolve()
+        if backup.parent != backup_root:
+            raise ValueError("Backups must come from the bot backup directory.")
+        check = sqlite3.connect(backup.as_posix())
+        try:
+            tables = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"users", "guild_settings", "bot_meta"}.issubset(tables):
+                raise ValueError("Backup does not contain the expected bot schema.")
+            check.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            check.close()
+        await self.db.close()
+        shutil.copy2(backup, self.db_path)
+        self.db = await aiosqlite.connect(self.db_path.as_posix())
+        if self.support_store is not None:
+            await self.support_store.ensure_schema()
+
+    @tasks.loop(hours=BACKUP_INTERVAL_HOURS)
+    async def backup_loop(self):
+        try:
+            await self.backup_database("scheduled")
+        except Exception:
+            logger.exception("Scheduled database backup failed")
+
+    @backup_loop.before_loop
+    async def before_backup(self):
+        await self.wait_until_ready()
+
     async def ensure_user_record(self, member: discord.Member):
         await self.db.execute(
             """
@@ -353,6 +600,7 @@ class LevelBot(commands.Bot):
                 user_id,
                 guild_id,
                 xp,
+                lifetime_xp,
                 weekly_xp,
                 monthly_xp,
                 message_count,
@@ -364,7 +612,7 @@ class LevelBot(commands.Bot):
                 custom_msg,
                 birthday,
                 last_gift_used
-            ) VALUES (?, ?, 0, 0, 0, 0, 0, 1, 0, 0, 'No bio set.', NULL, NULL, 0)
+            ) VALUES (?, ?, 0, 0, 0, 0, 0, 0, 1, 0, 0, 'No bio set.', NULL, NULL, 0)
             """,
             (member.id, member.guild.id),
         )
@@ -384,9 +632,6 @@ class LevelBot(commands.Bot):
                    audit_channel_id,
                    status_channel_id,
                    quiet_event_channel_id,
-                   minecraft_announce_channel_id,
-                   minecraft_announce_enabled,
-                   minecraft_daily_xp_cap,
                    quiet_event_until,
                    quiet_event_multiplier,
                    last_message_at,
@@ -409,15 +654,12 @@ class LevelBot(commands.Bot):
             "audit_channel_id": row[4],
             "status_channel_id": row[5],
             "quiet_event_channel_id": row[6],
-            "minecraft_announce_channel_id": row[7],
-            "minecraft_announce_enabled": row[8],
-            "minecraft_daily_xp_cap": row[9],
-            "quiet_event_until": row[10],
-            "quiet_event_multiplier": row[11],
-            "last_message_at": row[12],
-            "last_quiet_event_at": row[13],
-            "quiet_event_message_channel_id": row[14],
-            "quiet_event_message_id": row[15],
+            "quiet_event_until": row[7],
+            "quiet_event_multiplier": row[8],
+            "last_message_at": row[9],
+            "last_quiet_event_at": row[10],
+            "quiet_event_message_channel_id": row[11],
+            "quiet_event_message_id": row[12],
         }
 
     def get_configured_channel(self, guild: discord.Guild, channel_id: int):
@@ -655,6 +897,39 @@ class LevelBot(commands.Bot):
             if not guild.get_role(role_id):
                 findings.append(f"Role config references deleted role `{role_id}`.")
 
+        if self.support_store is not None:
+            support_settings = await self.support_store.get_settings(guild.id)
+            if support_settings.enabled:
+                support_forum = guild.get_channel(support_settings.forum_channel_id) if support_settings.forum_channel_id else None
+                if not is_forum_channel(support_forum):
+                    findings.append("Support workflow is enabled but its forum channel is missing or invalid.")
+                else:
+                    bindings = await self.support_store.get_tag_bindings(guild.id)
+                    missing_states = [
+                        CANONICAL_TAG_NAMES[state]
+                        for state in ("unanswered", "open", "waiting", "solved")
+                        if state not in bindings
+                    ]
+                    if missing_states:
+                        findings.append("Support lifecycle tags are missing: " + ", ".join(missing_states) + ".")
+                    forum_perms = support_forum.permissions_for(member)
+                    for permission in ("view_channel", "send_messages", "embed_links", "manage_threads"):
+                        if not getattr(forum_perms, permission, False):
+                            findings.append(f"Support forum is missing `{permission.replace('_', ' ').title()}`.")
+                staff_roles = await self.support_store.get_staff_roles(guild.id)
+                for role_id in staff_roles:
+                    if not guild.get_role(role_id):
+                        findings.append(f"Support staff config references deleted role `{role_id}`.")
+
+        async with self.db.execute(
+            "SELECT channel_id FROM channel_lock_backups WHERE guild_id = ?",
+            (guild.id,),
+        ) as cursor:
+            lock_backup_ids = [row[0] for row in await cursor.fetchall()]
+        for channel_id in lock_backup_ids:
+            if not guild.get_channel(channel_id):
+                findings.append(f"Channel lock backup references a deleted or inaccessible channel `{channel_id}`.")
+
         findings.extend(required_channel_perms)
         return findings
 
@@ -709,251 +984,155 @@ class LevelBot(commands.Bot):
         except discord.Forbidden:
             return False
 
-    async def start_minecraft_api(self):
-        app = web.Application()
-        app.router.add_post("/minecraft/activity", self.handle_minecraft_activity)
-        app.router.add_get("/minecraft/health", self.handle_minecraft_health)
-        self.minecraft_api_runner = web.AppRunner(app)
-        await self.minecraft_api_runner.setup()
-        self.minecraft_api_site = web.TCPSite(self.minecraft_api_runner, MINECRAFT_API_HOST, MINECRAFT_API_PORT)
-        await self.minecraft_api_site.start()
-        print(f"Minecraft API listening on {MINECRAFT_API_HOST}:{MINECRAFT_API_PORT}")
-
-    async def handle_minecraft_health(self, request):
-        return web.json_response({"ok": True, "service": "labworks-minecraft-api"})
-
-    def minecraft_api_authorized(self, request):
-        auth_header = request.headers.get("Authorization", "")
-        bearer_token = auth_header.removeprefix("Bearer ").strip()
-        header_token = request.headers.get("X-API-Token", "").strip()
-        return secrets.compare_digest(bearer_token or header_token, MINECRAFT_API_TOKEN)
-
-    async def handle_minecraft_activity(self, request):
-        if not MINECRAFT_API_TOKEN or not self.minecraft_api_authorized(request):
-            return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
-
-        event_type = str(payload.get("event_type", "")).strip().lower()
-        if event_type == "link":
-            return await self.handle_minecraft_link_payload(payload)
-
-        minecraft_uuid = str(payload.get("minecraft_uuid", "")).strip()
-        minecraft_name = str(payload.get("minecraft_name", "")).strip()[:32]
-        event_key = str(payload.get("event_key", "")).strip()
-        xp_requested = int(payload.get("xp", 0) or 0)
-
-        if not minecraft_uuid or not event_type or not event_key or xp_requested <= 0:
-            return web.json_response({"ok": False, "error": "missing_required_fields"}, status=400)
-
-        async with self.db.execute(
-            "SELECT discord_id FROM minecraft_links WHERE minecraft_uuid = ?",
-            (minecraft_uuid,),
-        ) as cursor:
-            link = await cursor.fetchone()
-        if not link:
-            return web.json_response({"ok": False, "error": "minecraft_account_not_linked"}, status=404)
-
-        discord_id = int(link[0])
-        member = self.find_minecraft_reward_member(discord_id)
-        if not member:
-            return web.json_response({"ok": False, "error": "discord_member_not_found"}, status=404)
-
-        duplicate = await self.minecraft_event_exists(minecraft_uuid, event_type, event_key)
-        if duplicate:
-            return web.json_response({"ok": True, "duplicate": True, "xp_awarded": 0})
-
-        settings = await self.fetch_guild_settings(member.guild.id)
-        daily_cap = int(settings.get("minecraft_daily_xp_cap") or MINECRAFT_DAILY_XP_CAP) if settings else MINECRAFT_DAILY_XP_CAP
-        today_awarded = await self.get_minecraft_daily_xp(discord_id)
-        remaining_cap = max(0, daily_cap - today_awarded)
-        xp_awarded = min(xp_requested, remaining_cap)
-
-        await self.log_minecraft_xp_event(
-            minecraft_uuid=minecraft_uuid,
-            discord_id=discord_id,
-            event_type=event_type,
-            event_key=event_key,
-            xp_awarded=xp_awarded,
+    async def log_activity(self, guild_id, user_id, activity_type, amount=0, details=""):
+        await self.db.execute(
+            "INSERT INTO activity_log (guild_id, user_id, activity_type, amount, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, user_id, activity_type, int(amount or 0), details[:500], time.time()),
         )
 
-        if minecraft_name:
-            await self.db.execute(
-                "UPDATE minecraft_links SET minecraft_name = ? WHERE minecraft_uuid = ?",
-                (minecraft_name, minecraft_uuid),
-            )
+    async def current_week_key(self):
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%G-W%V")
 
-        if xp_awarded > 0:
-            await self.add_xp(member, xp_awarded, can_announce_level_up=False)
-            await self.announce_minecraft_xp(member, minecraft_name or minecraft_uuid, event_type, xp_awarded)
-        else:
-            await self.db.commit()
-
-        return web.json_response({
-            "ok": True,
-            "discord_id": discord_id,
-            "xp_awarded": xp_awarded,
-            "daily_cap": daily_cap,
-            "daily_awarded": today_awarded + xp_awarded,
-        })
-
-    async def handle_minecraft_link_payload(self, payload):
-        code = str(payload.get("code", "")).strip().upper()
-        minecraft_uuid = str(payload.get("minecraft_uuid", "")).strip()
-        minecraft_name = str(payload.get("minecraft_name", "")).strip()[:32]
-        now = time.time()
-
-        if not code or not minecraft_uuid:
-            return web.json_response({"ok": False, "error": "missing_link_fields"}, status=400)
-
-        async with self.db.execute(
-            "SELECT discord_id, guild_id, expires_at FROM minecraft_link_codes WHERE code = ?",
-            (code,),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        if not row:
-            return web.json_response({"ok": False, "error": "invalid_code"}, status=404)
-
-        discord_id, guild_id, expires_at = row
-        if expires_at < now:
-            await self.db.execute("DELETE FROM minecraft_link_codes WHERE code = ?", (code,))
-            await self.db.commit()
-            return web.json_response({"ok": False, "error": "expired_code"}, status=410)
-
-        await self.db.execute("DELETE FROM minecraft_links WHERE discord_id = ? OR minecraft_uuid = ?", (discord_id, minecraft_uuid))
+    async def ensure_weekly_challenge(self, guild_id, week_key=None):
+        week_key = week_key or await self.current_week_key()
+        index = sum(ord(char) for char in f"{guild_id}:{week_key}") % len(WEEKLY_CHALLENGE_TEMPLATES)
+        metric, title, description, target, reward = WEEKLY_CHALLENGE_TEMPLATES[index]
+        challenge_key = metric
         await self.db.execute(
             """
-            INSERT INTO minecraft_links (minecraft_uuid, minecraft_name, discord_id, linked_at)
-            VALUES (?, ?, ?, ?)
+            INSERT OR IGNORE INTO weekly_challenges
+                (guild_id, week_key, challenge_key, metric, title, description, target, reward_xp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (minecraft_uuid, minecraft_name, discord_id, datetime.datetime.utcnow().isoformat()),
+            (guild_id, week_key, metric, metric, title, description.format(target=target), target, reward),
         )
-        await self.db.execute("DELETE FROM minecraft_link_codes WHERE code = ?", (code,))
+        return week_key, metric, title, description.format(target=target), target, reward
+
+    async def record_challenge_progress(self, member, amount, metric="messages"):
+        week_key, challenge_key, title, description, target, reward = await self.ensure_weekly_challenge(member.guild.id)
+        if (metric == "messages" and amount <= 0) or (metric == "xp" and amount <= 0):
+            return None
+        async with self.db.execute(
+            "SELECT metric FROM weekly_challenges WHERE guild_id=? AND week_key=?",
+            (member.guild.id, week_key),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row or row[0] != metric:
+            return None
+        async with self.db.execute(
+            "SELECT progress, completed_at FROM challenge_progress WHERE user_id=? AND guild_id=? AND week_key=? AND challenge_key=?",
+            (member.id, member.guild.id, week_key, challenge_key),
+        ) as cursor:
+            current = await cursor.fetchone()
+        if current and current[1]:
+            return None
+        progress = min(target, (current[0] if current else 0) + int(amount))
+        completed_at = time.time() if progress >= target else None
+        await self.db.execute(
+            """
+            INSERT INTO challenge_progress (user_id, guild_id, week_key, challenge_key, progress, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, guild_id, week_key, challenge_key)
+            DO UPDATE SET progress=excluded.progress, completed_at=excluded.completed_at
+            """,
+            (member.id, member.guild.id, week_key, challenge_key, progress, completed_at),
+        )
+        if completed_at:
+            await self.log_activity(member.guild.id, member.id, "challenge_completed", reward, challenge_key)
         await self.db.commit()
-
-        guild = self.get_guild(int(guild_id)) if guild_id else None
-        member = guild.get_member(int(discord_id)) if guild else self.find_minecraft_reward_member(int(discord_id))
-        if member:
-            try:
-                await member.send(f"Your Minecraft account **{minecraft_name or minecraft_uuid}** is now linked.")
-            except discord.Forbidden:
-                pass
-
-        return web.json_response({"ok": True, "discord_id": int(discord_id), "minecraft_uuid": minecraft_uuid})
-
-    def find_minecraft_reward_member(self, discord_id: int):
-        if MINECRAFT_TARGET_GUILD_ID:
-            guild = self.get_guild(MINECRAFT_TARGET_GUILD_ID)
-            return guild.get_member(discord_id) if guild else None
-
-        for guild in self.guilds:
-            member = guild.get_member(discord_id)
-            if member:
-                return member
+        if completed_at:
+            await self.add_xp(member, reward, is_salary=True, check_achievements=False, check_challenges=False)
+            return title, reward
         return None
 
-    async def minecraft_event_exists(self, minecraft_uuid: str, event_type: str, event_key: str):
-        async with self.db.execute(
-            """
-            SELECT 1 FROM minecraft_xp_events
-            WHERE minecraft_uuid = ? AND event_type = ? AND event_key = ?
-            """,
-            (minecraft_uuid, event_type, event_key),
-        ) as cursor:
-            return await cursor.fetchone() is not None
+    async def check_achievements(self, member):
+        async with self.achievement_lock:
+            async with self.db.execute(
+                "SELECT lifetime_xp, level, message_count, voice_minutes, rebirth FROM users WHERE user_id=? AND guild_id=?",
+                (member.id, member.guild.id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                return []
+            values = dict(zip(("lifetime_xp", "level", "messages", "voice_minutes", "rebirth"), row))
+            async with self.db.execute(
+                "SELECT achievement_key FROM user_achievements WHERE user_id=? AND guild_id=?",
+                (member.id, member.guild.id),
+            ) as cursor:
+                unlocked = {item[0] for item in await cursor.fetchall()}
+            newly_unlocked = []
+            for key, name, description, metric, target, reward in ACHIEVEMENTS:
+                if key in unlocked or values.get(metric, 0) < target:
+                    continue
+                await self.db.execute(
+                    "INSERT OR IGNORE INTO user_achievements (user_id, guild_id, achievement_key, unlocked_at) VALUES (?, ?, ?, ?)",
+                    (member.id, member.guild.id, key, time.time()),
+                )
+                await self.log_activity(member.guild.id, member.id, "achievement_unlocked", reward, key)
+                newly_unlocked.append((name, description, reward))
+            await self.db.commit()
+            return newly_unlocked
 
-    async def get_minecraft_daily_xp(self, discord_id: int):
-        start_of_day = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        async with self.db.execute(
-            """
-            SELECT COALESCE(SUM(xp_awarded), 0)
-            FROM minecraft_xp_events
-            WHERE discord_id = ? AND created_at >= ?
-            """,
-            (discord_id, start_of_day),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row[0] or 0)
-
-    async def log_minecraft_xp_event(self, minecraft_uuid: str, discord_id: int, event_type: str, event_key: str, xp_awarded: int):
-        await self.db.execute(
-            """
-            INSERT INTO minecraft_xp_events (
-                minecraft_uuid,
-                discord_id,
-                event_type,
-                event_key,
-                xp_awarded,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                minecraft_uuid,
-                discord_id,
-                event_type,
-                event_key,
-                xp_awarded,
-                datetime.datetime.utcnow().isoformat(),
-            ),
-        )
-
-    async def announce_minecraft_xp(self, member: discord.Member, minecraft_name: str, event_type: str, xp_awarded: int):
-        settings = await self.fetch_guild_settings(member.guild.id)
-        enabled = bool(settings.get("minecraft_announce_enabled")) if settings else MINECRAFT_ANNOUNCE_ENABLED
-        if not enabled:
-            return
-
-        channel = self.get_configured_channel(member.guild, settings.get("minecraft_announce_channel_id", 0) if settings else 0)
-        if not channel:
-            channel = await self.get_announcement_channel(member.guild)
-        if not channel:
-            return
-
-        try:
-            await channel.send(f"Minecraft XP: **{minecraft_name}** earned **{xp_awarded} XP** for `{event_type}`.")
-        except discord.Forbidden:
-            pass
-    
     # --- LOGIC ---
-    async def add_xp(self, member, amount, is_salary=False, can_announce_level_up=False):
+    async def add_xp(self, member, amount, is_salary=False, can_announce_level_up=False, check_achievements=True, check_challenges=True):
         if amount <= 0:
             await self.ensure_user_record(member)
             await self.db.commit()
             return False, 1, None
 
-        await self.ensure_user_record(member)
+        async with self.xp_lock:
+            await self.ensure_user_record(member)
 
-        # 1. Fetch User Data
-        async with self.db.execute("SELECT xp, level, rebirth, custom_msg FROM users WHERE user_id = ? AND guild_id = ?", (member.id, member.guild.id)) as cursor:
-            data = await cursor.fetchone()
+            # 1. Fetch User Data
+            async with self.db.execute("SELECT xp, level, rebirth, custom_msg FROM users WHERE user_id = ? AND guild_id = ?", (member.id, member.guild.id)) as cursor:
+                data = await cursor.fetchone()
 
-        current_xp, current_level, current_rebirth, custom_msg = data
+            current_xp, current_level, current_rebirth, custom_msg = data
         
-        # 2. Fetch Multipliers
-        rebirth_mult = 1.0 + (current_rebirth * 0.2)
-        role_mult = await calculate_multiplier(member)
+            # 2. Fetch Multipliers
+            rebirth_mult = 1.0 + (current_rebirth * 0.2)
+            role_mult = await calculate_multiplier(member)
         
-        temp_mult = 1.0
-        now = time.time()
-        await self.db.execute("DELETE FROM active_boosts WHERE end_time < ?", (now,))
-        async with self.db.execute("SELECT multiplier FROM active_boosts WHERE user_id=? AND guild_id=?", (member.id, member.guild.id)) as c:
-            boost_data = await c.fetchone()
-            if boost_data: temp_mult = boost_data[0]
+            temp_mult = 1.0
+            now = time.time()
+            await self.db.execute("DELETE FROM active_boosts WHERE end_time < ?", (now,))
+            async with self.db.execute("SELECT MAX(multiplier) FROM active_boosts WHERE user_id=? AND guild_id=?", (member.id, member.guild.id)) as c:
+                boost_data = await c.fetchone()
+                if boost_data and boost_data[0] is not None: temp_mult = boost_data[0]
             
-        settings = await self.fetch_guild_settings(member.guild.id)
-        global_mult = settings["global_xp_mult"] if settings else 1.0
-        audit_id = settings["audit_channel_id"] if settings else 0
-        quiet_event_mult = 1.0
-        if settings and settings["quiet_event_until"] and settings["quiet_event_until"] > now:
-            quiet_event_mult = max(1.0, settings["quiet_event_multiplier"])
+            settings = await self.fetch_guild_settings(member.guild.id)
+            global_mult = settings["global_xp_mult"] if settings else 1.0
+            audit_id = settings["audit_channel_id"] if settings else 0
+            quiet_event_mult = 1.0
+            if settings and settings["quiet_event_until"] and settings["quiet_event_until"] > now:
+                quiet_event_mult = max(1.0, settings["quiet_event_multiplier"])
 
-        # 3. Calculate Final
-        final_xp = int(amount * rebirth_mult * role_mult * temp_mult * global_mult * quiet_event_mult)
+            # 3. Calculate Final
+            final_xp = int(amount * rebirth_mult * role_mult * temp_mult * global_mult * quiet_event_mult)
         
+            new_xp = current_xp + final_xp
+        
+            # 5. Level Up Logic
+            xp_needed = 5 * (current_level ** 2) + (50 * current_level) + 100
+            did_level_up = False
+            while new_xp >= xp_needed:
+                if current_level >= 200:
+                    new_xp = xp_needed
+                    break
+                current_level += 1
+                new_xp = new_xp - xp_needed
+                xp_needed = 5 * (current_level ** 2) + (50 * current_level) + 100
+                did_level_up = True
+
+            # 7. Save
+            await self.db.execute("""
+                UPDATE users 
+                SET xp = ?, lifetime_xp = lifetime_xp + ?, weekly_xp = weekly_xp + ?, monthly_xp = monthly_xp + ?, level = ? 
+                WHERE user_id = ? AND guild_id = ?
+            """, (new_xp, final_xp, final_xp, final_xp, current_level, member.id, member.guild.id))
+            await self.log_activity(member.guild.id, member.id, "xp", final_xp, "salary" if is_salary else "progression")
+        
+            await self.db.commit()
         # 4. AUDIT: Suspicious Activity Check
         if final_xp > 150 and audit_id != 0 and not is_salary:
             audit_chan = member.guild.get_channel(audit_id)
@@ -965,38 +1144,61 @@ class LevelBot(commands.Bot):
                 except Exception as e:
                     print(f"Audit Error: {e}")
 
-        new_xp = current_xp + final_xp
-        
-        # 5. Level Up Logic
-        xp_needed = 5 * (current_level ** 2) + (50 * current_level) + 100
-        did_level_up = False
-        while new_xp >= xp_needed:
-            if current_level >= 200:
-                new_xp = xp_needed
-                break
-            current_level += 1
-            new_xp = new_xp - xp_needed
-            xp_needed = 5 * (current_level ** 2) + (50 * current_level) + 100
-            did_level_up = True
-
-        # 6. Role Swapping 
+        # A Discord outage must not discard an already earned level.
         if did_level_up:
-            await self.sync_level_roles_for_member(member, current_level)
-
-        # 7. Save
-        await self.db.execute("""
-            UPDATE users 
-            SET xp = ?, weekly_xp = weekly_xp + ?, monthly_xp = monthly_xp + ?, level = ? 
-            WHERE user_id = ? AND guild_id = ?
-        """, (new_xp, final_xp, final_xp, current_level, member.id, member.guild.id))
-        
-        await self.db.commit()
+            try:
+                await self.sync_level_roles_for_member(member, current_level)
+            except discord.HTTPException:
+                logger.warning("Level saved but role sync failed for user %s", member.id, exc_info=True)
         if not can_announce_level_up:
-            return False, current_level, None
-        return did_level_up, current_level, custom_msg
+            result = (False, current_level, None)
+        else:
+            result = (did_level_up, current_level, custom_msg)
+        if check_challenges:
+            await self.record_challenge_progress(member, final_xp, "xp")
+        if check_achievements:
+            newly_unlocked = await self.check_achievements(member)
+            for name, description, reward in newly_unlocked:
+                await self.add_xp(member, reward, is_salary=True, check_achievements=False)
+                logger.info("Achievement unlocked: %s for %s", name, member.id)
+        return result
 
 # --- SALARY DEPLOYMENT ---
-    async def deploy_salaries_to_guild(self, guild: discord.Guild):
+    async def claim_salary_run(self, guild_id, period_key):
+        now = time.time()
+        async with self.xp_lock:
+            async with self.db.execute(
+                "SELECT status, started_at FROM salary_runs WHERE guild_id=? AND period_key=?",
+                (guild_id, period_key),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing and existing[0] == "completed":
+                return False
+            if existing and existing[0] == "running" and now - existing[1] < SCHEDULED_SALARY_GRACE_SECONDS:
+                return False
+            await self.db.execute(
+                """
+                INSERT INTO salary_runs (guild_id, period_key, started_at, status)
+                VALUES (?, ?, ?, 'running')
+                ON CONFLICT(guild_id, period_key)
+                DO UPDATE SET started_at=excluded.started_at, status='running', completed_at=NULL
+                """,
+                (guild_id, period_key, now),
+            )
+            await self.db.commit()
+            return True
+
+    async def finish_salary_run(self, guild_id, period_key, users_paid, total_xp, status="completed"):
+        await self.db.execute(
+            "UPDATE salary_runs SET status=?, completed_at=?, users_paid=?, total_xp=? WHERE guild_id=? AND period_key=?",
+            (status, time.time(), users_paid, total_xp, guild_id, period_key),
+        )
+        await self.db.commit()
+
+    async def deploy_salaries_to_guild(self, guild: discord.Guild, force=False):
+        period_key = f"manual-{time.time_ns()}" if force else datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H")
+        if not await self.claim_salary_run(guild.id, period_key):
+            return 0, 0
         try:
             async with self.db.execute("SELECT role_id, amount FROM presence_roles WHERE guild_id=?", (guild.id,)) as cursor:
                 salaries = {row[0]: row[1] for row in await cursor.fetchall()}
@@ -1066,9 +1268,11 @@ class LevelBot(commands.Bot):
                     except discord.Forbidden:
                         pass
                         
+            await self.finish_salary_run(guild.id, period_key, users_paid, total_xp_given)
             return users_paid, total_xp_given
 
         except Exception as e:
+            await self.finish_salary_run(guild.id, period_key, 0, 0, status="failed")
             print(f"Fatal Salary Error in {guild.name}: {e}")
             return 0, 0
 
@@ -1106,6 +1310,7 @@ class LevelBot(commands.Bot):
                             "UPDATE users SET voice_minutes = voice_minutes + 1 WHERE user_id = ? AND guild_id = ?",
                             (member.id, guild.id),
                         )
+                        await self.record_challenge_progress(member, 1, "voice_minutes")
                         await self.db.commit()
                         await asyncio.sleep(0.1)
                     except Exception as e:
@@ -1137,22 +1342,37 @@ class LevelBot(commands.Bot):
                 s = await c.fetchone()
             if s and s[0] != 0:
                 channel = guild.get_channel(s[0])
-                if channel: await channel.send(f"🎂 Happy Birthday <@{user_id}>! Hope you have a fantastic day! 🎉")
+                if channel:
+                    try:
+                        await channel.send(f"🎂 Happy Birthday <@{user_id}>! Hope you have a fantastic day! 🎉")
+                    except discord.HTTPException:
+                        logger.warning("Birthday announcement failed in guild %s", guild_id, exc_info=True)
 
     @birthday_loop.before_loop
     async def before_birthday(self): await self.wait_until_ready()
 
-    @tasks.loop(time=datetime.time(hour=0, minute=0, tzinfo=datetime.timezone.utc))
+    @tasks.loop(minutes=15)
     async def reset_stats_loop(self):
-        now = datetime.datetime.utcnow()
-        if now.day == 1:
-            await self.db.execute("UPDATE users SET monthly_xp = 0")
-        if now.weekday() == 0:
-            await self.db.execute("UPDATE users SET weekly_xp = 0")
-        await self.db.commit()
+        await self.reconcile_periodic_stats()
 
     @reset_stats_loop.before_loop
     async def before_reset_stats(self): await self.wait_until_ready()
+
+    async def reconcile_periodic_stats(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        week_key = now.strftime("%G-W%V")
+        month_key = now.strftime("%Y-%m")
+        previous_week = await self.get_meta("stats_week_key")
+        previous_month = await self.get_meta("stats_month_key")
+        if previous_week and previous_week != week_key:
+            await self.db.execute("UPDATE users SET weekly_xp = 0")
+            await self.log_activity(0, None, "weekly_reset", 0, f"{previous_week}->{week_key}")
+        if previous_month and previous_month != month_key:
+            await self.db.execute("UPDATE users SET monthly_xp = 0")
+            await self.log_activity(0, None, "monthly_reset", 0, f"{previous_month}->{month_key}")
+        await self.set_meta("stats_week_key", week_key)
+        await self.set_meta("stats_month_key", month_key)
+        await self.db.commit()
 
     @tasks.loop(minutes=1)
     async def heartbeat_loop(self):
@@ -1304,6 +1524,7 @@ async def on_message(message):
             "UPDATE users SET message_count = message_count + 1 WHERE user_id = ? AND guild_id = ?",
             (message.author.id, message.guild.id),
         )
+        await bot.record_challenge_progress(message.author, 1, "messages")
 
         channel_mult = 1.0
         async with bot.db.execute("SELECT multiplier FROM channel_multipliers WHERE channel_id=?", (message.channel.id,)) as c:
@@ -1311,11 +1532,17 @@ async def on_message(message):
             if cm_data:
                 channel_mult = cm_data[0]
 
-        async with bot.db.execute("SELECT next_xp_time FROM users WHERE user_id=? AND guild_id=?", (message.author.id, message.guild.id)) as cursor:
-            data = await cursor.fetchone()
+        # Claim the cooldown in one SQL statement before any Discord API await.
+        can_gain_xp = False
+        if len(content) >= 3:
+            async with bot.db.execute(
+                "UPDATE users SET next_xp_time=? WHERE user_id=? AND guild_id=? AND next_xp_time<=?",
+                (current_time + random.randint(15, 30), message.author.id, message.guild.id, current_time),
+            ) as cursor:
+                can_gain_xp = cursor.rowcount == 1
+            await bot.db.commit()
 
-        can_gain_xp = current_time >= (data[0] if data else 0)
-        if can_gain_xp and len(content) >= 3:
+        if can_gain_xp:
             leveled_up, new_level, custom_msg = await bot.add_xp(
                 message.author,
                 int(random.randint(15, 25) * channel_mult),
@@ -1325,18 +1552,19 @@ async def on_message(message):
             if leveled_up:
                 settings = await bot.fetch_guild_settings(message.guild.id)
                 target = bot.get_configured_channel(message.guild, settings["level_channel_id"] if settings else 0) or message.channel
-
                 if new_level == 75:
-                    await target.send(f"💀 {message.author.mention} hit **Level 75**. Welcome back from inactivity...")
+                    notice = f"💀 {message.author.mention} hit **Level 75**. Welcome back from inactivity..."
                 elif custom_msg:
-                    await target.send(custom_msg.replace("{user}", message.author.mention).replace("{level}", str(new_level)))
+                    notice = custom_msg.replace("{user}", message.author.mention).replace("{level}", str(new_level))
                 else:
-                    await target.send(f"🎉 {message.author.mention} reached **Level {new_level}**!")
-
-            await bot.db.execute(
-                "UPDATE users SET next_xp_time=? WHERE user_id=? AND guild_id=?",
-                (current_time + random.randint(15, 30), message.author.id, message.guild.id),
-            )
+                    notice = f"🎉 {message.author.mention} reached **Level {new_level}**!"
+                try:
+                    await target.send(
+                        notice[:2000],
+                        allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[message.author]),
+                    )
+                except discord.HTTPException:
+                    logger.warning("Level saved but announcement failed", exc_info=True)
 
     await bot.db.commit()
     await bot.process_commands(message)
@@ -1345,7 +1573,7 @@ async def on_message(message):
 # 🎛️ DEV MENU & DASHBOARDS
 # =========================================
 
-class DevValueModal(ui.Modal, title="Update Player Stats"):
+class DevValueModal(AdminModal, title="Update Player Stats"):
     amount = ui.TextInput(label="Enter Amount", placeholder="10")
     def __init__(self, target_user, mode):
         super().__init__()
@@ -1355,11 +1583,14 @@ class DevValueModal(ui.Modal, title="Update Player Stats"):
     async def on_submit(self, interaction: discord.Interaction):
         try:
             val = int(self.amount.value)
+            if (self.mode == "level" and not 1 <= val <= 200) or (self.mode != "level" and not 0 <= val <= 10000):
+                raise ValueError
             col = "level" if self.mode == "level" else "rebirth"
-            await bot.ensure_user_record(self.target_user)
-            extra_sql = ", xp=0" if self.mode == "level" else ""
-            await bot.db.execute(f"UPDATE users SET {col} = ?{extra_sql} WHERE user_id = ? AND guild_id = ?", (val, self.target_user.id, interaction.guild.id))
-            await bot.db.commit()
+            async with bot.xp_lock:
+                await bot.ensure_user_record(self.target_user)
+                extra_sql = ", xp=0" if self.mode == "level" else ""
+                await bot.db.execute(f"UPDATE users SET {col} = ?{extra_sql} WHERE user_id = ? AND guild_id = ?", (val, self.target_user.id, interaction.guild.id))
+                await bot.db.commit()
             
             async with bot.db.execute("SELECT audit_channel_id FROM guild_settings WHERE guild_id=?", (interaction.guild.id,)) as c:
                 d = await c.fetchone()
@@ -1370,12 +1601,11 @@ class DevValueModal(ui.Modal, title="Update Player Stats"):
             await interaction.response.send_message(f"✅ Set {self.target_user.name}'s {self.mode} to **{val}**.", ephemeral=True)
         except: await interaction.response.send_message("❌ Invalid integer.", ephemeral=True)
 
-class GlobalEventModal(ui.Modal, title="Global XP Event"):
+class GlobalEventModal(AdminModal, title="Global XP Event"):
     mult = ui.TextInput(label="Global Multiplier (1.0 = Normal)", placeholder="2.0")
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            val = float(self.mult.value)
-            if val < 1.0: val = 1.0
+            val = finite_multiplier(self.mult.value)
             await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
             await bot.db.execute("UPDATE guild_settings SET global_xp_mult = ? WHERE guild_id = ?", (val, interaction.guild.id))
             await bot.db.commit()
@@ -1406,7 +1636,7 @@ class StatusChannelSelect(ui.ChannelSelect):
         await interaction.response.send_message(f"📡 Bot status updates will be sent to {self.values[0].mention}.", ephemeral=True)
 
 
-class Level100SalaryModal(ui.Modal, title="Level 100+ Salary"):
+class Level100SalaryModal(AdminModal, title="Level 100+ Salary"):
     amount = ui.TextInput(label="Hourly XP salary", placeholder="50")
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -1421,7 +1651,7 @@ class Level100SalaryModal(ui.Modal, title="Level 100+ Salary"):
         except ValueError:
             await interaction.response.send_message("❌ Enter a whole number that is 0 or higher.", ephemeral=True)
 
-class PlayerDevView(ui.View):
+class PlayerDevView(AdminView):
     def __init__(self, target):
         super().__init__()
         self.target = target
@@ -1446,17 +1676,17 @@ class DevDashboardSelect(ui.Select):
     
     async def callback(self, interaction: discord.Interaction):
         if self.values[0] == "player":
-            view = ui.View()
+            view = AdminView()
             view.add_item(DevUserSelect())
             await interaction.response.send_message("Select a player to edit:", view=view, ephemeral=True)
         elif self.values[0] == "global":
             await interaction.response.send_modal(GlobalEventModal())
         elif self.values[0] == "audit":
-            view = ui.View()
+            view = AdminView()
             view.add_item(AuditChannelSelect())
             await interaction.response.send_message("Select a channel for Audit Logs:", view=view, ephemeral=True)
 
-class DevDashboard(ui.View):
+class DevDashboard(AdminView):
     def __init__(self):
         super().__init__()
         self.add_item(DevDashboardSelect())
@@ -1474,7 +1704,7 @@ async def dev(interaction: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def force_salaries(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    users_paid, total_xp = await bot.deploy_salaries_to_guild(interaction.guild)
+    users_paid, total_xp = await bot.deploy_salaries_to_guild(interaction.guild, force=True)
     await interaction.followup.send(f"✅ **Salaries Forced!**\nDistributed **{total_xp:,} XP** to **{users_paid}** users.")
 
 # =========================================
@@ -1516,13 +1746,14 @@ class LeaderboardView(discord.ui.View):
             "message_count": "💬 Top Chatters (Message Count)"
         }
         
+        value_col = "lifetime_xp" if self.sort_col == "xp" else self.sort_col
         if self.sort_col == "xp":
-            order_clause = "CAST(level AS INTEGER) DESC, CAST(xp AS INTEGER) DESC"
+            order_clause = "CAST(lifetime_xp AS INTEGER) DESC"
         else:
-            order_clause = f"CAST({self.sort_col} AS INTEGER) DESC"
+            order_clause = f"CAST({value_col} AS INTEGER) DESC"
 
         query = f"""
-            SELECT user_id, {self.sort_col}, level, rebirth 
+            SELECT user_id, {value_col}, level, rebirth 
             FROM users 
             WHERE guild_id = ? 
             ORDER BY {order_clause} 
@@ -1586,6 +1817,89 @@ async def leaderboard(interaction: discord.Interaction):
     embed = await view.generate_embed()
     await interaction.response.send_message(embed=embed, view=view)
 
+
+@bot.tree.command(name="achievements", description="View unlocked achievements and progress")
+async def achievements(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    await bot.ensure_user_record(target)
+    async with bot.db.execute(
+        "SELECT lifetime_xp, level, message_count, voice_minutes, rebirth FROM users WHERE user_id=? AND guild_id=?",
+        (target.id, interaction.guild.id),
+    ) as cursor:
+        row = await cursor.fetchone()
+    values = dict(zip(("lifetime_xp", "level", "messages", "voice_minutes", "rebirth"), row or (0, 1, 0, 0, 0)))
+    async with bot.db.execute(
+        "SELECT achievement_key, unlocked_at FROM user_achievements WHERE user_id=? AND guild_id=?",
+        (target.id, interaction.guild.id),
+    ) as cursor:
+        unlocked = {item[0]: item[1] for item in await cursor.fetchall()}
+    lines = []
+    for key, name, description, metric, target_value, reward in ACHIEVEMENTS:
+        if key in unlocked:
+            lines.append(f"✅ **{name}** — {description} (+{reward:,} XP)")
+        else:
+            lines.append(f"▫️ **{name}** — {values.get(metric, 0):,}/{target_value:,} {metric.replace('_', ' ')}")
+    embed = discord.Embed(title=f"🏅 {target.display_name}'s Achievements", description="\n".join(lines), color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="challenge", description="View this week's community challenge")
+async def challenge(interaction: discord.Interaction):
+    week_key, challenge_key, title, description, target, reward = await bot.ensure_weekly_challenge(interaction.guild.id)
+    async with bot.db.execute(
+        "SELECT progress, completed_at FROM challenge_progress WHERE user_id=? AND guild_id=? AND week_key=? AND challenge_key=?",
+        (interaction.user.id, interaction.guild.id, week_key, challenge_key),
+    ) as cursor:
+        progress = await cursor.fetchone()
+    current = progress[0] if progress else 0
+    status = "✅ Complete" if progress and progress[1] else f"{current:,}/{target:,}"
+    embed = discord.Embed(title=f"🎯 Weekly Challenge: {title}", description=description, color=discord.Color.blurple())
+    embed.add_field(name="Your progress", value=status, inline=True)
+    embed.add_field(name="Reward", value=f"{reward:,} XP", inline=True)
+    embed.set_footer(text=f"Week {week_key}; progress resets automatically.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="activity", description="Review recent XP and reward activity (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def activity(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    since = time.time() - 86400
+    async with bot.db.execute(
+        "SELECT activity_type, COUNT(*), COALESCE(SUM(amount), 0) FROM activity_log WHERE guild_id=? AND created_at>=? GROUP BY activity_type ORDER BY SUM(amount) DESC",
+        (interaction.guild.id, since),
+    ) as cursor:
+        summary = await cursor.fetchall()
+    async with bot.db.execute(
+        "SELECT user_id, activity_type, amount, details, created_at FROM activity_log WHERE guild_id=? ORDER BY id DESC LIMIT 15",
+        (interaction.guild.id,),
+    ) as cursor:
+        recent = await cursor.fetchall()
+    summary_text = "\n".join(f"• `{kind}`: {count} events / {amount:,} XP" for kind, count, amount in summary) or "No activity recorded in the last 24 hours."
+    recent_text = "\n".join(f"<@{user_id}> `{kind}` {amount:+,} ({details})" for user_id, kind, amount, details, _ in recent) or "No recent events."
+    embed = discord.Embed(title="📈 Bot Activity Dashboard", color=discord.Color.teal())
+    embed.add_field(name="Last 24 hours", value=summary_text[:1024], inline=False)
+    embed.add_field(name="Recent events", value=recent_text[:1024], inline=False)
+    if bot.support_store is not None:
+        support_summary = await bot.support_store.activity_summary(interaction.guild.id, since)
+        support_recent = await bot.support_store.recent_activity(interaction.guild.id)
+        support_summary_text = "\n".join(f"• `{kind}`: {count} events" for kind, count in support_summary) or "No support activity in the last 24 hours."
+        support_recent_text = "\n".join(
+            f"{('<@' + str(actor_id) + '>') if actor_id else 'system'} `{kind}` thread `{thread_id or '-'}` ({details})"
+            for actor_id, thread_id, kind, details, _created_at, _correlation_id in support_recent
+        ) or "No recent support events."
+        embed.add_field(name="Support activity (24h)", value=support_summary_text[:1024], inline=False)
+        embed.add_field(name="Recent support events", value=support_recent_text[:1024], inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="backup", description="Create an immediate database backup (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def backup(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    destination = await bot.backup_database("manual")
+    await interaction.followup.send(f"✅ Backup created: `{destination.name}`", ephemeral=True)
+
 # =========================================
 # 🎛️ CONFIG DASHBOARD
 # =========================================
@@ -1646,6 +1960,21 @@ async def build_config_overview_embed(guild: discord.Guild):
         ),
         inline=True,
     )
+    if bot.support_store is not None:
+        support = await bot.support_store.get_settings(guild.id)
+        support_forum = guild.get_channel(support.forum_channel_id) if support.forum_channel_id else None
+        support_roles = await bot.support_store.get_staff_roles(guild.id)
+        support_bindings = await bot.support_store.get_tag_bindings(guild.id)
+        embed.add_field(
+            name="Support workflow",
+            value=(
+                f"Status: **{'Enabled' if support.enabled else 'Disabled'}**\n"
+                f"Forum: {support_forum.mention if support_forum else 'Not set'}\n"
+                f"Staff roles: **{len(support_roles)}**\n"
+                f"Lifecycle tags: **{len(support_bindings)}/4**"
+            ),
+            inline=False,
+        )
     return embed
 
 
@@ -1668,22 +1997,21 @@ async def build_health_check_embed(guild: discord.Guild):
         )
     return embed
 
-class MultiplierModal(ui.Modal, title="XP Multiplier"):
+class MultiplierModal(AdminModal, title="XP Multiplier"):
     amount = ui.TextInput(label="Multiplier", placeholder="1.5")
     def __init__(self, target_id, is_role=True):
         super().__init__()
         self.target_id, self.is_role = target_id, is_role
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            val = float(self.amount.value)
-            if val < 1.0: raise ValueError
+            val = finite_multiplier(self.amount.value)
             table, col = ("role_multipliers", "role_id") if self.is_role else ("channel_multipliers", "channel_id")
             await bot.db.execute(f"INSERT OR REPLACE INTO {table} ({col}, guild_id, multiplier) VALUES (?, ?, ?)", (self.target_id, interaction.guild.id, val))
             await bot.db.commit()
             await interaction.response.send_message(f"✅ Set **x{val}** multiplier.", ephemeral=True)
         except: await interaction.response.send_message("❌ Invalid number.", ephemeral=True)
 
-class SalaryModal(ui.Modal, title="Hourly Salary"):
+class SalaryModal(AdminModal, title="Hourly Salary"):
     amount = ui.TextInput(label="XP Amount", placeholder="50")
     def __init__(self, role_id):
         super().__init__()
@@ -1691,12 +2019,14 @@ class SalaryModal(ui.Modal, title="Hourly Salary"):
     async def on_submit(self, interaction: discord.Interaction):
         try:
             val = int(self.amount.value)
+            if not 0 <= val <= 100000:
+                raise ValueError
             await bot.db.execute("INSERT OR REPLACE INTO presence_roles (role_id, guild_id, amount) VALUES (?, ?, ?)", (self.role_id, interaction.guild.id, val))
             await bot.db.commit()
             await interaction.response.send_message(f"✅ Set salary to **{val} XP/hr**.", ephemeral=True)
         except: await interaction.response.send_message("❌ Invalid integer.", ephemeral=True)
 
-class LevelRoleModal(ui.Modal, title="Level Requirement"):
+class LevelRoleModal(AdminModal, title="Level Requirement"):
     level = ui.TextInput(label="Level to unlock role", placeholder="10")
     def __init__(self, role_id):
         super().__init__()
@@ -1704,13 +2034,13 @@ class LevelRoleModal(ui.Modal, title="Level Requirement"):
     async def on_submit(self, interaction: discord.Interaction):
         try:
             val = int(self.level.value)
-            if val < 2: raise ValueError
+            if not 2 <= val <= 200: raise ValueError
             await bot.db.execute("INSERT OR REPLACE INTO level_roles (level, role_id, guild_id) VALUES (?, ?, ?)", (val, self.role_id, interaction.guild.id))
             await bot.db.commit()
             await interaction.response.send_message(f"✅ Role will be given at **Level {val}**.", ephemeral=True)
-        except: await interaction.response.send_message("❌ Invalid Level (Must be 2+).", ephemeral=True)
+        except: await interaction.response.send_message("❌ Invalid Level (Must be 2–200).", ephemeral=True)
 
-class RoleActionView(ui.View):
+class RoleActionView(AdminView):
     def __init__(self, role):
         super().__init__()
         self.role = role
@@ -1733,7 +2063,7 @@ class RoleActionView(ui.View):
     @ui.button(label="Assign to Level", style=discord.ButtonStyle.primary)
     async def set_lvl(self, i, b): await i.response.send_modal(LevelRoleModal(self.role.id))
 
-class ChannelActionView(ui.View):
+class ChannelActionView(AdminView):
     def __init__(self, channel):
         super().__init__()
         self.channel = channel
@@ -1779,7 +2109,7 @@ class SponsorUserSelect(ui.UserSelect):
     async def callback(self, interaction: discord.Interaction):
         user = self.values[0]
         if self.mode == "add":
-            view = ui.View()
+            view = AdminView()
             view.add_item(SponsorTierSelect(user))
             await interaction.response.send_message(f"Select tier for **{user.name}**:", view=view, ephemeral=True)
         else:
@@ -1787,29 +2117,29 @@ class SponsorUserSelect(ui.UserSelect):
             await bot.db.commit()
             await interaction.response.send_message(f"🗑️ Removed **{user.name}**.", ephemeral=True)
 
-class SponsorSettingsView(ui.View):
+class SponsorSettingsView(AdminView):
     @ui.button(label="Add Sponsor", style=discord.ButtonStyle.green, emoji="➕")
     async def add_sponsor_btn(self, i, b):
-        view = ui.View()
+        view = AdminView()
         view.add_item(SponsorUserSelect(mode="add"))
         await i.response.send_message("Select user to **ADD**:", view=view, ephemeral=True)
     @ui.button(label="Remove Sponsor", style=discord.ButtonStyle.red, emoji="➖")
     async def remove_sponsor_btn(self, i, b):
-        view = ui.View()
+        view = AdminView()
         view.add_item(SponsorUserSelect(mode="remove"))
         await i.response.send_message("Select user to **REMOVE**:", view=view, ephemeral=True)
 
 
-class SystemSettingsView(ui.View):
+class SystemSettingsView(AdminView):
     @ui.button(label="Set Status Channel", style=discord.ButtonStyle.primary, emoji="📡")
     async def set_status(self, interaction: discord.Interaction, button: ui.Button):
-        view = ui.View()
+        view = AdminView()
         view.add_item(StatusChannelSelect())
         await interaction.response.send_message("Select the channel for startup, restart, and health updates:", view=view, ephemeral=True)
 
     @ui.button(label="Set Audit Channel", style=discord.ButtonStyle.secondary, emoji="🔒")
     async def set_audit(self, interaction: discord.Interaction, button: ui.Button):
-        view = ui.View()
+        view = AdminView()
         view.add_item(AuditChannelSelect())
         await interaction.response.send_message("Select the audit log channel:", view=view, ephemeral=True)
 
@@ -1826,7 +2156,7 @@ class SystemSettingsView(ui.View):
         embed = await build_health_check_embed(interaction.guild)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-class ConfigDashboard(ui.View):
+class ConfigDashboard(AdminView):
     def __init__(self):
         super().__init__()
         self.add_item(ConfigSelect())
@@ -1838,6 +2168,7 @@ class ConfigSelect(ui.Select):
             discord.SelectOption(label="Manage Channels", description="Boosts, Routing", emoji="📢", value="channels"),
             discord.SelectOption(label="System Settings", description="Status, audit, salary, health", emoji="⚙️", value="system"),
             discord.SelectOption(label="Overview", description="Quick configuration summary", emoji="🧭", value="overview"),
+            discord.SelectOption(label="Support Workflow", description="Forum lifecycle, tags, reminders", emoji="🧵", value="support"),
             discord.SelectOption(label="Sponsors", description="Add/Remove Sponsors", emoji="💎", value="general"),
             discord.SelectOption(label="View Role Stats", description="List levels, multipliers, and salaries", emoji="📊", value="view_role_stats")
         ]
@@ -1847,7 +2178,7 @@ class ConfigSelect(ui.Select):
         val = self.values[0]
         
         if val == "roles":
-            view = ui.View()
+            view = AdminView()
             role_select = ui.RoleSelect(placeholder="Pick a role...")
             async def role_callback(inter):
                 await inter.response.send_message(f"⚙️ **{role_select.values[0].name}**:", view=RoleActionView(role_select.values[0]), ephemeral=True)
@@ -1856,7 +2187,7 @@ class ConfigSelect(ui.Select):
             await interaction.response.send_message(embed=discord.Embed(title="🛡️ Roles", color=discord.Color.blue()), view=view, ephemeral=True)
             
         elif val == "channels":
-            view = ui.View()
+            view = AdminView()
             chan_select = ui.ChannelSelect(channel_types=[discord.ChannelType.text, discord.ChannelType.voice], placeholder="Pick a channel...")
             async def chan_callback(inter):
                 await inter.response.send_message(f"⚙️ **{chan_select.values[0].name}**:", view=ChannelActionView(chan_select.values[0]), ephemeral=True)
@@ -1878,6 +2209,13 @@ class ConfigSelect(ui.Select):
         elif val == "overview":
             embed = await build_config_overview_embed(interaction.guild)
             await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        elif val == "support":
+            operations = bot.get_cog("OperationsCog")
+            if operations is None:
+                await interaction.response.send_message("Support operations are not loaded yet.", ephemeral=True)
+            else:
+                await operations.send_support_config(interaction)
             
         elif val == "general":
             await interaction.response.send_message(embed=discord.Embed(title="💎 Sponsors", color=discord.Color.gold()), view=SponsorSettingsView(), ephemeral=True)
@@ -1926,6 +2264,7 @@ async def config(interaction: discord.Interaction):
     embed.add_field(name="📢 Channels", value="Set Channel Boosts & Message Routing.", inline=True)
     embed.add_field(name="⚙️ System", value="Set status, audit, health, global XP, and level-100 salary.", inline=True)
     embed.add_field(name="🧭 Overview", value="Review current server configuration at a glance.", inline=True)
+    embed.add_field(name="🧵 Support", value="Configure forum lifecycle, reminders, staff roles, and canned responses.", inline=True)
     embed.add_field(name="💎 Sponsors", value="Add/Remove Sponsors.", inline=True)
     await interaction.response.send_message(embed=embed, view=ConfigDashboard(), ephemeral=True)
 
@@ -1936,122 +2275,6 @@ async def healthcheck(interaction: discord.Interaction):
     embed = await build_health_check_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
-def generate_minecraft_link_code():
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(6))
-
-
-@bot.tree.command(name="linkminecraft", description="Generate a code to link your Minecraft account")
-async def linkminecraft(interaction: discord.Interaction):
-    now = time.time()
-    await bot.db.execute("DELETE FROM minecraft_link_codes WHERE expires_at < ?", (now,))
-
-    code = generate_minecraft_link_code()
-    while True:
-        async with bot.db.execute("SELECT 1 FROM minecraft_link_codes WHERE code = ?", (code,)) as cursor:
-            if not await cursor.fetchone():
-                break
-        code = generate_minecraft_link_code()
-
-    await bot.db.execute(
-        """
-        INSERT OR REPLACE INTO minecraft_link_codes (
-            code,
-            discord_id,
-            guild_id,
-            expires_at,
-            created_at
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            code,
-            interaction.user.id,
-            interaction.guild.id,
-            now + MINECRAFT_LINK_CODE_TTL_SECONDS,
-            now,
-        ),
-    )
-    await bot.db.commit()
-
-    minutes = max(1, MINECRAFT_LINK_CODE_TTL_SECONDS // 60)
-    await interaction.response.send_message(
-        f"Use `/linkdiscord {code}` in Minecraft within **{minutes} minutes** to link your account.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="minecraftprofile", description="View your linked Minecraft account and Minecraft XP status")
-async def minecraftprofile(interaction: discord.Interaction, member: discord.Member = None):
-    target = member or interaction.user
-    async with bot.db.execute(
-        """
-        SELECT minecraft_uuid, minecraft_name, linked_at
-        FROM minecraft_links
-        WHERE discord_id = ?
-        """,
-        (target.id,),
-    ) as cursor:
-        link = await cursor.fetchone()
-
-    if not link:
-        await interaction.response.send_message(f"{target.mention} has not linked a Minecraft account yet.", ephemeral=True)
-        return
-
-    settings = await bot.fetch_guild_settings(interaction.guild.id)
-    daily_cap = int(settings.get("minecraft_daily_xp_cap") or MINECRAFT_DAILY_XP_CAP) if settings else MINECRAFT_DAILY_XP_CAP
-    daily_xp = await bot.get_minecraft_daily_xp(target.id)
-
-    embed = discord.Embed(title=f"Minecraft Profile: {target.display_name}", color=discord.Color.green())
-    embed.add_field(name="Minecraft Name", value=link[1] or "Unknown", inline=True)
-    embed.add_field(name="UUID", value=f"`{link[0]}`", inline=False)
-    embed.add_field(name="Today's Minecraft XP", value=f"**{daily_xp:,} / {daily_cap:,} XP**", inline=True)
-    embed.add_field(name="Linked At", value=link[2] or "Unknown", inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="unlinkminecraft", description="Unlink your Minecraft account")
-async def unlinkminecraft(interaction: discord.Interaction):
-    async with bot.db.execute("SELECT minecraft_name FROM minecraft_links WHERE discord_id = ?", (interaction.user.id,)) as cursor:
-        link = await cursor.fetchone()
-    if not link:
-        await interaction.response.send_message("You do not have a linked Minecraft account.", ephemeral=True)
-        return
-
-    await bot.db.execute("DELETE FROM minecraft_links WHERE discord_id = ?", (interaction.user.id,))
-    await bot.db.commit()
-    await interaction.response.send_message(f"Unlinked Minecraft account **{link[0] or 'Unknown'}**.", ephemeral=True)
-
-
-@bot.tree.command(name="minecraftxpcap", description="Set the daily Minecraft XP cap for this server")
-@app_commands.checks.has_permissions(administrator=True)
-async def minecraftxpcap(interaction: discord.Interaction, amount: app_commands.Range[int, 0, 100000]):
-    await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
-    await bot.db.execute(
-        "UPDATE guild_settings SET minecraft_daily_xp_cap = ? WHERE guild_id = ?",
-        (int(amount), interaction.guild.id),
-    )
-    await bot.db.commit()
-    await interaction.response.send_message(f"Minecraft daily XP cap set to **{amount:,} XP**.", ephemeral=True)
-
-
-@bot.tree.command(name="minecraftannounce", description="Configure Minecraft XP gain announcements")
-@app_commands.checks.has_permissions(administrator=True)
-async def minecraftannounce(interaction: discord.Interaction, enabled: bool, channel: discord.TextChannel = None):
-    await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
-    await bot.db.execute(
-        """
-        UPDATE guild_settings
-        SET minecraft_announce_enabled = ?,
-            minecraft_announce_channel_id = ?
-        WHERE guild_id = ?
-        """,
-        (1 if enabled else 0, channel.id if channel else 0, interaction.guild.id),
-    )
-    await bot.db.commit()
-    destination = channel.mention if channel else "the default bot announcement channel"
-    state = "enabled" if enabled else "disabled"
-    await interaction.response.send_message(f"Minecraft XP announcements are now **{state}** in {destination}.", ephemeral=True)
 
 # =========================================
 # 👑 SPONSORS & PROFILES
@@ -2110,15 +2333,14 @@ def load_rank_font(size: int, bold: bool = False):
     return ImageFont.load_default()
 
 
-async def fetch_rank_positions(user_id: int, guild_id: int, level: int, xp: int):
+async def fetch_rank_positions(user_id: int, guild_id: int, lifetime_xp: int):
     async with bot.db.execute(
         """
         SELECT COUNT(*) + 1
         FROM users
-        WHERE guild_id = ?
-          AND (level > ? OR (level = ? AND xp > ?))
+        WHERE guild_id = ? AND lifetime_xp > ?
         """,
-        (guild_id, level, level, xp),
+        (guild_id, lifetime_xp),
     ) as cursor:
         server_rank = (await cursor.fetchone())[0]
 
@@ -2126,9 +2348,9 @@ async def fetch_rank_positions(user_id: int, guild_id: int, level: int, xp: int)
         """
         SELECT COUNT(*) + 1
         FROM users
-        WHERE (level > ? OR (level = ? AND xp > ?))
+        WHERE lifetime_xp > ?
         """,
-        (level, level, xp),
+        (lifetime_xp,),
     ) as cursor:
         global_rank = (await cursor.fetchone())[0]
 
@@ -2417,6 +2639,8 @@ class ProfileGroup(app_commands.Group):
             d = await c.fetchone()
         if not d or d[0] < 20: return await i.response.send_message("❌ You must be **Level 20** to set a custom message.", ephemeral=True)
         if "{user}" not in message and "{level}" not in message: return await i.response.send_message("❌ Message must contain `{user}` or `{level}`.", ephemeral=True)
+        if len(message) > 1000:
+            return await i.response.send_message("❌ Keep custom messages under 1,001 characters.", ephemeral=True)
         await bot.db.execute("UPDATE users SET custom_msg = ? WHERE user_id=? AND guild_id=?", (message, i.user.id, i.guild.id))
         await bot.db.commit()
         await i.response.send_message("✅ Message updated!", ephemeral=True)
@@ -2467,43 +2691,46 @@ async def boost_user(interaction: discord.Interaction, target: discord.Member):
     if interaction.user.id == target.id:
         return await interaction.response.send_message("❌ You cannot boost yourself! Spread the love to a friend.", ephemeral=True)
 
-    await bot.ensure_user_record(interaction.user)
-    await bot.ensure_user_record(target)
-    async with bot.db.execute("SELECT level, last_gift_used FROM users WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
-        d = await c.fetchone()
+    async with bot.xp_lock:
+        await bot.ensure_user_record(interaction.user)
+        await bot.ensure_user_record(target)
+        async with bot.db.execute("SELECT level, last_gift_used FROM users WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
+            d = await c.fetchone()
     
-    if not d or d[0] < 150: 
-        return await interaction.response.send_message("❌ You must be **Level 150** to use this.", ephemeral=True)
+        if not d or d[0] < 150: 
+            return await interaction.response.send_message("❌ You must be **Level 150** to use this.", ephemeral=True)
 
-    last_used = d[1]
-    now = time.time()
-    cooldown = 86400 # 24 hours
+        last_used = d[1]
+        now = time.time()
+        cooldown = 86400 # 24 hours
 
-    if now - last_used < cooldown:
-        remaining = cooldown - (now - last_used)
-        hours = int(remaining // 3600)
-        minutes = int((remaining % 3600) // 60)
-        return await interaction.response.send_message(f"❌ **Cooldown Active:** You can gift again in **{hours}h {minutes}m**.", ephemeral=True)
+        if now - last_used < cooldown:
+            remaining = cooldown - (now - last_used)
+            hours = int(remaining // 3600)
+            minutes = int((remaining % 3600) // 60)
+            return await interaction.response.send_message(f"❌ **Cooldown Active:** You can gift again in **{hours}h {minutes}m**.", ephemeral=True)
 
-    end_time = now + 3600 # 1 hour
-    await bot.db.execute("INSERT OR REPLACE INTO active_boosts (user_id, guild_id, end_time, multiplier) VALUES (?, ?, ?, ?)", (target.id, interaction.guild.id, end_time, 2.0))
-    await bot.db.execute("UPDATE users SET last_gift_used = ? WHERE user_id=? AND guild_id=?", (now, interaction.user.id, interaction.guild.id))
-    await bot.db.commit()
+        end_time = now + 3600 # 1 hour
+        await bot.db.execute("DELETE FROM active_boosts WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id))
+        await bot.db.execute("INSERT OR REPLACE INTO active_boosts (user_id, guild_id, end_time, multiplier) VALUES (?, ?, ?, ?)", (target.id, interaction.guild.id, end_time, 2.0))
+        await bot.db.execute("UPDATE users SET last_gift_used = ? WHERE user_id=? AND guild_id=?", (now, interaction.user.id, interaction.guild.id))
+        await bot.db.commit()
     await interaction.response.send_message(f"🎁 **GIFT SENT!** {target.mention} now has a **2x XP Boost** for 1 hour!")
     
 @bot.tree.command(name="rank", description="Check your stats or another user's")
 async def rank(interaction: discord.Interaction, member: discord.Member = None):
+    await interaction.response.defer()
     target = member or interaction.user
     
-    async with bot.db.execute("SELECT xp, level, rebirth, bio, message_count, voice_minutes FROM users WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
+    async with bot.db.execute("SELECT xp, lifetime_xp, level, rebirth, bio, message_count, voice_minutes FROM users WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
         data = await c.fetchone()
     async with bot.db.execute("SELECT tier_name FROM sponsors WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
         s_data = await c.fetchone()
     
-    xp, level, rebirth, bio, message_count, voice_minutes = data if data else (0, 1, 0, "No bio set.", 0, 0)
+    xp, lifetime_xp, level, rebirth, bio, message_count, voice_minutes = data if data else (0, 0, 1, 0, "No bio set.", 0, 0)
     
     xp_needed = xp_needed_for_level(level)
-    total_xp = total_xp_for_state(level, xp)
+    total_xp = lifetime_xp
     percent = min(100, max(0, (xp / xp_needed) * 100))
     bar = "🟦" * int(percent / 10) + "⬜" * (10 - int(percent / 10))
     
@@ -2540,7 +2767,7 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
         boosts_text += f"🔄 **Rebirth {to_roman(rebirth)}**: x{round(rebirth_mult, 1)}\n"
 
     temp_mult = 1.0
-    async with bot.db.execute("SELECT end_time, multiplier FROM active_boosts WHERE user_id=? AND guild_id=?", (target.id, interaction.guild.id)) as c:
+    async with bot.db.execute("SELECT end_time, multiplier FROM active_boosts WHERE user_id=? AND guild_id=? ORDER BY end_time DESC LIMIT 1", (target.id, interaction.guild.id)) as c:
         temp = await c.fetchone()
     if temp and temp[0] > time.time():
         temp_mult = temp[1]
@@ -2549,7 +2776,7 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
     grand_total = global_mult * quiet_mult * channel_mult * role_mult * rebirth_mult * temp_mult
 
     sponsor_tier = s_data[0] if s_data else None
-    server_rank, global_rank = await fetch_rank_positions(target.id, interaction.guild.id, level, xp)
+    server_rank, global_rank = await fetch_rank_positions(target.id, interaction.guild.id, lifetime_xp)
     next_reward, upcoming_roles = await fetch_role_rewards(interaction.guild, level)
     rank_card = await create_rank_card(
         target=target,
@@ -2573,9 +2800,9 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
         if boosts_text:
             embed = discord.Embed(color=target.color)
             embed.add_field(name="🚀 Active Boosts", value=boosts_text, inline=False)
-            await interaction.response.send_message(embed=embed, file=rank_card)
+            await interaction.followup.send(embed=embed, file=rank_card)
         else:
-            await interaction.response.send_message(file=rank_card)
+            await interaction.followup.send(file=rank_card)
         return
 
     embed = discord.Embed(title=f"🛡️ {target.display_name}", description=f"*{bio}*", color=target.color)
@@ -2589,15 +2816,16 @@ async def rank(interaction: discord.Interaction, member: discord.Member = None):
         embed.add_field(name="🚀 Active Boosts", value=boosts_text, inline=False)
     embed.set_footer(text="Install Pillow to enable image rank cards.")
     embed = await maybe_apply_sponsor_promo(embed, interaction.user.id, interaction.guild.id, chance=0.16)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="rebirth", description="Reset to Level 1 for a permanent boost (Level 200+)")
 async def rebirth(interaction: discord.Interaction):
-    async with bot.db.execute("SELECT level, rebirth FROM users WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
-        data = await c.fetchone()
-    if not data or data[0] < 200: return await interaction.response.send_message("❌ Need Level 200.", ephemeral=True)
-    await bot.db.execute("UPDATE users SET level=1, xp=0, rebirth=? WHERE user_id=? AND guild_id=?", (data[1] + 1, interaction.user.id, interaction.guild.id))
-    await bot.db.commit()
+    async with bot.xp_lock:
+        async with bot.db.execute("SELECT level, rebirth FROM users WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id)) as c:
+            data = await c.fetchone()
+        if not data or data[0] < 200: return await interaction.response.send_message("❌ Need Level 200.", ephemeral=True)
+        await bot.db.execute("UPDATE users SET level=1, xp=0, rebirth=? WHERE user_id=? AND guild_id=?", (data[1] + 1, interaction.user.id, interaction.guild.id))
+        await bot.db.commit()
     await bot.sync_level_roles_for_member(interaction.user, 1)
     await interaction.response.send_message(f"🚨 **REBIRTH!** {interaction.user.mention} is now Rebirth **{to_roman(data[1] + 1)}**!")
 
@@ -2619,7 +2847,13 @@ async def on_app_command_error(i: discord.Interaction, e: app_commands.AppComman
             await i.followup.send("🚫 Admin Only.", ephemeral=True)
         else:
             await i.response.send_message("🚫 Admin Only.", ephemeral=True)
-    else: print(f"Error: {e}")
+    else:
+        logger.error("Application command failed", exc_info=(type(e), e, e.__traceback__))
+        message = "Something went wrong. Please try again or contact a server admin."
+        if i.response.is_done():
+            await i.followup.send(message, ephemeral=True)
+        else:
+            await i.response.send_message(message, ephemeral=True)
 
 @bot.command()
 @commands.is_owner()
@@ -2751,8 +2985,8 @@ async def debug_user_db(interaction: discord.Interaction, target: discord.Member
 
     await interaction.followup.send("\n".join(debug_msg))
 
-discord_token = os.getenv("DISCORD_TOKEN")
-if not discord_token:
-    raise RuntimeError("DISCORD_TOKEN is missing. Set it in src/.env or pass it as a container environment variable.")
-
-bot.run(discord_token)
+if __name__ == "__main__":
+    discord_token = os.getenv("DISCORD_TOKEN")
+    if not discord_token:
+        raise RuntimeError("DISCORD_TOKEN is missing. Set it in src/.env or pass it as a container environment variable.")
+    bot.run(discord_token)

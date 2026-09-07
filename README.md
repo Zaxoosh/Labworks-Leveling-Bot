@@ -1,5 +1,25 @@
 # Labworks Leveling Bot
 
+This project was imported and matched against the running Unraid bot on 2026-09-05. See [UNRAID_HANDOVER.md](UNRAID_HANDOVER.md) for verified server access, file provenance, and remote deployment steps.
+
+The audit changes are documented in [AUDIT.md](AUDIT.md) and are deployed to Unraid as `labworkslevelbot:20260906-lifetime-xp`. The obsolete game integration has been removed; this version runs only the Discord bot.
+
+The project includes lifetime XP, achievements, rotating weekly challenges, idempotent salary periods, persistent SQLite backups, an administrator activity dashboard, a legacy lifetime-XP backfill, and an opt-in support-forum operations pack.
+
+Run local regression tests without a Discord token or connection:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Backups are written below `data/backups/` (or `/data/backups` in Docker). To validate a backup without changing anything:
+
+```powershell
+python scripts/restore_backup.py data/backups/levels-YYYYMMDDTHHMMSSZ-manual.db
+```
+
+Stop the bot before adding `--apply`; the script saves the current database before replacing it.
+
 A multi-server Discord leveling bot built with discord.py and aiosqlite.  
 Designed for the Labworks community to encourage engagement through leveling, rebirths, passive XP, and social boosts.
 
@@ -70,7 +90,7 @@ Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-Create an environment file in the project root named .env:
+Create an environment file named `src/.env`:
 ```bash
 DISCORD_TOKEN=your_bot_token_here
 ```
@@ -79,15 +99,11 @@ Database notes:
 
 Run the bot:
 ```bash
-python main.py
+python src/main.py
 ```
 ---
 
 ## Commands
-
-Here is the updated **Commands** section for your `README.md` in Markdown format. You can copy and paste this directly.
-
----
 
 ### 🎮 Commands
 
@@ -115,6 +131,21 @@ Here is the updated **Commands** section for your `README.md` in Markdown format
 | `!sync` | (Owner Only) Instantly syncs Slash Commands to the current guild. |
 | `!clearglobals` | (Owner Only) Wipes all global slash commands for troubleshooting. |
 
+#### **Support Operations Pack**
+
+The support workflow is disabled by default for each guild. Administrators configure it through `/config` → **Support Workflow**:
+
+- choose a forum, configure multiple support-staff roles, and set reminder timings;
+- provision or reuse the `Unanswered`, `Open`, `Waiting for Reply`, and `Solved` forum tags;
+- automatically track post replies, prompt incomplete starters once, send persisted reminders, and archive solved/unanswered posts safely;
+- use `/solved`, `/unsolve`, and `/incomplete-post` inside support posts;
+- manage reusable responses with `/tag create`, `/tag use`, `/tag info`, `/tag edit`, and `/tag delete`;
+- use administrator-only `/lock`, `/unlock`, and `/slowmode` for up to five text/forum channels at a time. Locking stores complete permission overwrites in SQLite and restores them on unlock.
+
+Default lifecycle timing is 10 minutes before `Waiting for Reply`, a first reminder at 24 hours when the latest reply is not from the creator, a hard reminder at 72 hours, and closure 24 hours after the hard reminder. `/config` → **Support Workflow** can adjust these values.
+
+Set `LABWORKS_SYNC_GUILD_IDS` to a comma-separated list of guild IDs when the bot should sync slash commands to more than the legacy development guild. The default remains the existing test guild when the variable is unset.
+
 ---
 
 ### ⚙️ Setup & Configuration
@@ -124,10 +155,6 @@ To get the bot fully operational after installation:
 1. **Role Mapping:** Use `/config` -> **Manage Roles** -> **Assign to Level** to link your Discord roles to the leveling system.
 2. **Channel Routing:** Use `/config` -> **Manage Channels** -> **Route Level Ups** to keep general chat clean.
 3. **Security:** Use `/dev` -> **Security & Audit** to set a staff-only channel for logging suspicious XP gains (e.g., >150 XP per message).
-
----
-
-**Would you like me to generate a "Contribution Guidelines" section next to explain how to submit Pull Requests for new features?**
 
 ---
 
