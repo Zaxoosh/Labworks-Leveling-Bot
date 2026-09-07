@@ -71,7 +71,7 @@ def snowflake_timestamp(identifier: int) -> float:
 
 
 def is_forum_channel(channel: Any) -> bool:
-    return isinstance(channel, discord.ForumChannel) or (
+    return isinstance(channel, discord.ForumChannel) or getattr(channel, "type", None) == discord.ChannelType.forum or (
         channel is not None
         and hasattr(channel, "available_tags")
         and hasattr(channel, "create_tag")

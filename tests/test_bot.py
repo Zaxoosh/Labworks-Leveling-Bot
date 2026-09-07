@@ -278,6 +278,16 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"solved", "unsolve", "incomplete-post", "lock", "unlock", "slowmode"}.issubset(names))
         self.assertTrue({"tag create", "tag use", "tag info", "tag edit", "tag delete"}.issubset(names))
 
+    async def test_channel_select_partial_resolves_to_full_forum(self):
+        from src.support import is_forum_channel
+
+        forum = SimpleNamespace(id=500, guild=self.guild, available_tags=[], create_tag=AsyncMock())
+        selected = SimpleNamespace(id=forum.id, type=discord.ChannelType.forum, resolve=lambda: forum)
+        operations = self.bot.get_cog("OperationsCog")
+        resolved = await operations.resolve_selected_channel(self.guild, selected)
+        self.assertIs(resolved, forum)
+        self.assertTrue(is_forum_channel(resolved))
+
     async def test_canned_responses_are_isolated_and_case_insensitive(self):
         store = self.bot.support_store
         await store.create_response(10, "welcome", "Welcome to Labworks.", 20)

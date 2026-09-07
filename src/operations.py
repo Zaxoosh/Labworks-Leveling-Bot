@@ -293,8 +293,9 @@ class SupportConfigView(ui.View):
             async def callback(inner: discord.Interaction) -> None:
                 if not await require_admin(inner):
                     return
-                channel = selector.values[0]
-                if not is_forum_channel(channel):
+                selected = selector.values[0]
+                channel = await self.cog.resolve_selected_channel(inner.guild, selected)
+                if channel is None or not is_forum_channel(channel):
                     await send_interaction_message(inner, "That is not a forum channel.")
                     return
                 await self.cog.store.update_settings(inner.guild.id, forum_channel_id=channel.id)
@@ -356,7 +357,11 @@ class ChannelActionView(ui.View):
     async def apply(self, interaction: discord.Interaction, button: ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         results: list[str] = []
-        for channel in self.selector.values:
+        for selected in self.selector.values:
+            channel = await self.cog.resolve_selected_channel(interaction.guild, selected)
+            if channel is None:
+                results.append(f"❌ Could not resolve {getattr(selected, 'mention', selected)}.")
+                continue
             try:
                 if self.action == "lock":
                     await self.cog.lock_channel(interaction.guild, channel, interaction.user.id, self.reason)
@@ -389,6 +394,47 @@ class OperationsCog(commands.Cog):
         self.store = store
         self.support = support
         self.tag_cooldowns: dict[tuple[int, int], float] = {}
+
+    async def resolve_selected_channel(self, guild: discord.Guild, selected: Any) -> Any | None:
+        """Resolve a Discord channel-select value to a full guild channel.
+
+        Discord sends ``AppCommandChannel`` instances for channel selects. They
+        contain the selected channel's type and ID, but not mutable channel
+        features such as forum tags, permission overwrites, or ``edit``.
+        """
+
+        channel_id = getattr(selected, "id", None)
+        if channel_id is None:
+            return None
+
+        channel = None
+        resolver = getattr(selected, "resolve", None)
+        if callable(resolver):
+            channel = resolver()
+        if channel is None:
+            get_channel = getattr(guild, "get_channel", None)
+            if callable(get_channel):
+                channel = get_channel(int(channel_id))
+        if channel is None:
+            fetch = getattr(selected, "fetch", None)
+            if callable(fetch):
+                try:
+                    channel = await fetch()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    channel = None
+        if channel is None:
+            fetch_channel = getattr(self.bot, "fetch_channel", None)
+            if callable(fetch_channel):
+                try:
+                    channel = await fetch_channel(int(channel_id))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    channel = None
+
+        channel_guild = getattr(channel, "guild", None)
+        channel_guild_id = getattr(channel_guild, "id", None) or getattr(channel, "guild_id", None)
+        if channel is None or (channel_guild_id is not None and int(channel_guild_id) != int(guild.id)):
+            return None
+        return channel
 
     async def member_is_staff_or_admin(self, interaction: discord.Interaction, *, allow_public: bool = False) -> bool:
         if interaction.guild is None:
