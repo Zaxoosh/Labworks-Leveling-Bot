@@ -187,7 +187,11 @@ class ReminderView(ui.View):
             details="Member selected Still Need Help",
         )
         await self._disable(interaction)
-        await interaction.followup.send("Got it — the post will remain open. Please add any missing details or reply when ready.", ephemeral=True)
+        await interaction.followup.send(
+            "Got it — the post will remain open. Please reply here with an update or explain what you still need help with. "
+            "When the issue is resolved, use `/solved` to mark it as solved.",
+            ephemeral=True,
+        )
 
 
 class SupportCog(commands.Cog):
@@ -809,10 +813,12 @@ class SupportCog(commands.Cog):
             return False
         age_label = "72 hours" if hard else "24 hours"
         embed = discord.Embed(
-            title="Still need help with this?",
+            title="Is this issue resolved?",
             description=(
-                f"{_mention(post.creator_id)}, this support post has not had a recent reply for about {age_label}. "
-                "Use a button below or reply with an update."
+                f"{_mention(post.creator_id)}, it seems like your last message was sent more than {age_label} ago.\n"
+                "If we don't hear back from you, we'll assume the issue is resolved and mark your post as solved.\n"
+                "If the issue is resolved, use `/solved` to mark this post as solved. Otherwise, choose **Still Need Help** "
+                "and reply with an update."
             ),
             color=discord.Color.blurple(),
         )
@@ -833,7 +839,7 @@ class SupportCog(commands.Cog):
             reminder_stage=reminder_stage,
             reminder_message_id=getattr(sent, "id", None),
             reminder_sent_at=now,
-            close_at=now + settings.close_after_reminder_hours * 3600 if hard else None,
+            close_at=now + settings.close_after_reminder_hours * 3600,
         )
         await self.audit_action(
             guild,
@@ -947,8 +953,8 @@ class SupportCog(commands.Cog):
             await self.send_reminder(thread, post, settings, hard=True)
         elif post.reminder_stage == 1 and post.close_at and post.close_at <= now:
             # Also honor a close_at written by an older build or an operator
-            # override; normal first reminders leave this field empty so the
-            # hard reminder remains the next durable stage.
+            # override. New first reminders also receive a close_at so an
+            # inactive post can be closed after the configured grace period.
             await self.close_post(thread, post, reason="Close after unanswered support reminder")
         elif post.reminder_stage >= 2 and post.close_at and post.close_at <= now:
             await self.close_post(thread, post, reason="Close after unanswered support reminder")

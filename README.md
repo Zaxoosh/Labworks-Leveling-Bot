@@ -137,12 +137,12 @@ The support workflow is disabled by default for each guild. Administrators confi
 
 - choose a forum, configure multiple support-staff roles, and set reminder timings;
 - create the forum tags yourself in the forum channel settings, then select one existing tag for each required state (`Unanswered`, `Open`, `Waiting for Reply`, and `Solved`) through the configuration menu; the bot never creates or deletes forum tags;
-- automatically track post replies, prompt incomplete starters once, send persisted reminders, and archive solved/unanswered posts safely;
+- automatically track post replies, prompt incomplete starters once, remind requesters to use `/solved` after an unanswered staff reply, and archive solved/unanswered posts safely;
 - use `/solved`, `/unsolve`, and `/incomplete-post` inside support posts;
 - manage reusable responses with `/tag create`, `/tag use`, `/tag info`, `/tag edit`, and `/tag delete`;
 - use administrator-only `/lock`, `/unlock`, and `/slowmode` for up to five text/forum channels at a time. Locking stores complete permission overwrites in SQLite and restores them on unlock.
 
-Default lifecycle timing is 10 minutes before `Waiting for Reply`, a first reminder at 24 hours when the latest reply is not from the creator, a hard reminder at 72 hours, and closure 24 hours after the hard reminder. `/config` → **Support Workflow** can adjust these values.
+Default lifecycle timing is 10 minutes before `Waiting for Reply`, a first reminder at 24 hours when the latest reply is not from the creator, a hard reminder at 72 hours for older unanswered posts, and closure after the configured reminder grace period. `/config` → **Support Workflow** can adjust these values.
 
 Set `LABWORKS_SYNC_GUILD_IDS` to a comma-separated list of guild IDs when the bot should sync slash commands to more than the legacy development guild. The default remains the existing test guild when the variable is unset.
 

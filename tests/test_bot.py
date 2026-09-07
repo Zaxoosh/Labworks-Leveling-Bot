@@ -453,7 +453,12 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.support_store.update_post(10, thread.id, last_author_id=responder.id, last_message_at=time.time() - 25 * 3600, waiting_since=None)
         post = await self.bot.support_store.get_post(10, thread.id)
         await support.process_post(thread, post, settings)
-        self.assertEqual((await self.bot.support_store.get_post(10, thread.id)).reminder_stage, 1)
+        reminded_post = await self.bot.support_store.get_post(10, thread.id)
+        self.assertEqual(reminded_post.reminder_stage, 1)
+        self.assertIsNotNone(reminded_post.close_at)
+        reminder_embed = sent.await_args.kwargs["embed"]
+        self.assertIn("assume the issue is resolved", reminder_embed.description)
+        self.assertIn("/solved", reminder_embed.description)
         await self.bot.support_store.update_post(10, thread.id, last_message_at=time.time() - 73 * 3600)
         await support.process_post(thread, await self.bot.support_store.get_post(10, thread.id), settings)
         self.assertEqual((await self.bot.support_store.get_post(10, thread.id)).reminder_stage, 2)
