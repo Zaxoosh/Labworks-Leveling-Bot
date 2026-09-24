@@ -1,6 +1,6 @@
 # Labworks Discord Bot — project and remote access
 
-Remote baseline verified on 2026-09-05 before the local audit. The audited bot is deployed and verified on Unraid as `labworkslevelbot:20260906-lifetime-xp` (6 September 2026).
+Latest deployment verified on 2026-09-24: `labworkslevelbot:20260924-remove-sus-ping` is running on Unraid and connected to Discord.
 
 ## Source
 
@@ -11,22 +11,26 @@ Imported from `C:\Users\zaxoo\Desktop\Labworks Level Bot`, the repository used b
 - Originally imported 20 tracked files plus the Dockerfile and CSV import utility. The subsequent audit removed the obsolete Fabric integration and its setup guide at the user's request.
 - Current project includes the Discord bot, rank-card fonts, Dockerfile, CSV import utility, and regression tests.
 - The deployed version adds lifetime XP, legacy no-rebirth backfill, achievements, weekly challenges, idempotent salary runs, SQLite backups, restore tooling, and `/activity`.
-- Original repository and this project's Git metadata were preserved; no upstream remote was assigned to this new project.
+- GitHub remote: https://github.com/Zaxoosh/Labworks-Leveling-Bot.git (`origin`, branch `main`).
 - Credentials, databases, CSV exports, caches, and build outputs were excluded.
 
 ## Verified server
 
 - Host: `FribbetsBrain`, `192.168.0.100`, Unraid `7.2.4`.
-- SSH account: `root`; authenticated successfully with the existing dedicated key.
-- Container: `labworkslevelbot`, running since `2026-08-30T04:01:51Z`, restart count 0 at inspection.
-- Image: `labworkslevelbot:20260906-lifetime-xp`.
-- Image ID: `sha256:19d4fcde4e7fef46ed51ee61bb8a07bc6311f60415a24730ad3d8d030449f9ef`.
+- SSH account: `root`; authenticated with the dedicated key at `C:\Users\zaxoo\.ssh\labworks_unraid_codex`.
+- Container: `labworkslevelbot`, running with restart count 0 at verification on 2026-09-24.
+- Image: `labworkslevelbot:20260924-remove-sus-ping`.
+- Image ID: `sha256:d978aff6f02619f7bd4c30b9504e50a5ee691b0584b7f7c5eb6fceb5fc373985`.
 - Command: `python src/main.py`, working directory `/app`.
 - Persistent bind mount: `/mnt/user/appdata/labworkslevelbot` → `/data`, read/write.
 - API port: none; the retired HTTP integration is not exposed.
-- Current restart policy: preserved from the existing container configuration.
+- Restart policy: `no` (preserved from the existing container configuration).
 - The `/data` mount contains the migrated database, rank cards, and automatic backups.
-- Logs show a successful Discord Gateway connection after deployment.
+- No host ports are published.
+- Startup logs show `Bot Online & Synced` and a successful Discord Gateway connection. SQLite `PRAGMA integrity_check` returned `ok`.
+- The deployed `src/main.py` SHA-256 is `dd1fcddb6538a41763db1b24eb8a2e8eefb9c05234f49b089da7810e4eb12335`.
+- Pre-deployment data archive: `/mnt/user/appdata/labworkslevelbot-deploy/20260924-remove-sus-ping/data-backup.tar` (20,428,800 bytes, mode `0600`).
+- Rollback container: `labworkslevelbot-rollback-20260924-remove-sus-ping`, retaining image `labworkslevelbot:20260907-sapphire-reminders`.
 
 The original imported `src/main.py` and `requirements.txt` matched the running container. These are the production baseline hashes, not hashes of the locally audited files:
 
@@ -37,10 +41,10 @@ The original imported `src/main.py` and `requirements.txt` matched the running c
 
 ## Connect from this PC
 
-The private key remains outside this repository at `C:\Users\zaxoo\AppData\Local\Temp\opencode\unraid_ssh_key`. This is a temporary-directory dependency; preserve it in a secure durable credential location before any temp cleanup.
+The private key is stored outside this repository at `C:\Users\zaxoo\.ssh\labworks_unraid_codex`; only its public key is installed on Unraid. Never copy the private key into the repository or share it.
 
 ```powershell
-$botKey = 'C:\Users\zaxoo\AppData\Local\Temp\opencode\unraid_ssh_key'
+$botKey = 'C:\Users\zaxoo\.ssh\labworks_unraid_codex'
 ssh -i $botKey -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes root@192.168.0.100 'docker ps --filter name=labworkslevelbot'
 ```
 
@@ -48,19 +52,21 @@ SSH host verification uses the existing Windows `known_hosts` entry. The default
 
 ## Remote update capability
 
-Verified root SSH access, Docker daemon access, writable bot source in the container, and a successful temporary-file create/read/delete in the bot's persistent host directory. The temporary probe was removed. No application files were changed and the container was not restarted.
+Verified root SSH access, Docker daemon access, and writes to the dedicated deployment directory on Unraid. The currently authorized key is the dedicated key above.
 
-For a future approved bot update:
+For a future bot update:
 
-1. After user approval, inspect the current container configuration privately, preserving its Discord credentials, mount, networking, and image rollback reference. The new bot has no HTTP API: remove the obsolete port 8095 mapping and `MINECRAFT_*` variables when preparing the replacement container.
-2. Back up the persistent SQLite database consistently (SQLite backup API or a brief scoped bot stop) and preserve the current image.
-3. Upload this project's source and Dockerfile to a dedicated build directory on Unraid via SCP, then build a versioned Docker image remotely. This avoids depending on registry push credentials.
-4. Recreate only `labworkslevelbot` with its existing configuration and the new image. Its source is baked into the image, so a plain restart does not deploy local edits; edits inside the container are not durable across recreation.
-5. Verify startup logs, Discord connection, `/healthcheck`, `/rank`, `/achievements`, `/challenge`, `/activity`, backup creation, and persisted data. There is no HTTP health endpoint in the new version. Sync commands for every guild scope where they were previously registered so obsolete integration commands disappear; startup currently syncs only the configured test guild. Roll back to the saved image/configuration if verification fails.
+1. Inspect the current container configuration privately, preserving its Discord credentials, mount, networking, restart policy, and image rollback reference.
+2. Stop the bot briefly and archive `/data`; tag and retain the current image/container for rollback.
+3. Upload the source and Dockerfile to a versioned build directory, then build a versioned image on Unraid. This avoids depending on registry push credentials.
+4. Recreate only `labworkslevelbot` with its existing configuration and the new image. Its source is baked into the image, so a plain restart does not deploy local edits; edits inside the container are not durable across recreation. The bot has no HTTP API or published host ports.
+5. Verify startup logs, Discord Gateway connection, SQLite integrity, and persisted data. Roll back to the saved image/configuration if startup fails.
 
 The retired integration's tables/columns in an existing database are left untouched and unused. No destructive database cleanup is required to run the new version. Test coverage verifies old schema/data can still be opened safely.
 
 The 6 September 2026 deployment preserved the prior image as `labworkslevelbot-rollback-20260906-lifetime-xp`, saved a persistent data archive, and verified the `lifetime_xp_backfill_v2` migration. Registry push permissions were not required.
+
+The 24 September 2026 deployment committed as `ad77801` removed the suspicious-XP alert, preserved the prior container and image for rollback, archived `/data`, and verified successful startup, Gateway connection, and SQLite integrity. The same code is pushed to GitHub `main`.
 
 ## Local development
 
