@@ -1107,7 +1107,6 @@ class LevelBot(commands.Bot):
             
             settings = await self.fetch_guild_settings(member.guild.id)
             global_mult = settings["global_xp_mult"] if settings else 1.0
-            audit_id = settings["audit_channel_id"] if settings else 0
             quiet_event_mult = 1.0
             if settings and settings["quiet_event_until"] and settings["quiet_event_until"] > now:
                 quiet_event_mult = max(1.0, settings["quiet_event_multiplier"])
@@ -1138,17 +1137,6 @@ class LevelBot(commands.Bot):
             await self.log_activity(member.guild.id, member.id, "xp", final_xp, "salary" if is_salary else "progression")
         
             await self.db.commit()
-        # 4. AUDIT: Suspicious Activity Check
-        if final_xp > 150 and audit_id != 0 and not is_salary:
-            audit_chan = member.guild.get_channel(audit_id)
-            if audit_chan:
-                try:
-                    await audit_chan.send(f"⚠️ **SUSPICIOUS ACTIVITY**\nUser: {member.mention}\nGained: **{final_xp} XP** in one action.\nMultipliers: Rb `x{rebirth_mult}` | Role `x{role_mult}` | Global `x{global_mult}` | Quiet `x{quiet_event_mult}`")
-                except discord.Forbidden:
-                    pass
-                except Exception as e:
-                    print(f"Audit Error: {e}")
-
         # A Discord outage must not discard an already earned level.
         if did_level_up:
             try:
@@ -1627,7 +1615,7 @@ class AuditChannelSelect(ui.ChannelSelect):
         await bot.db.execute("INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)", (interaction.guild.id,))
         await bot.db.execute("UPDATE guild_settings SET audit_channel_id = ? WHERE guild_id = ?", (self.values[0].id, interaction.guild.id))
         await bot.db.commit()
-        await interaction.response.send_message(f"🔒 Security Log set to {self.values[0].mention}.", ephemeral=True)
+        await interaction.response.send_message(f"🔒 Audit log channel set to {self.values[0].mention}.", ephemeral=True)
 
 
 class StatusChannelSelect(ui.ChannelSelect):
@@ -1675,7 +1663,7 @@ class DevDashboardSelect(ui.Select):
         options = [
             discord.SelectOption(label="Player Management", description="Force Set Levels/Rebirths", emoji="👤", value="player"),
             discord.SelectOption(label="Global Events", description="Set Server-wide XP Multipliers", emoji="🌍", value="global"),
-            discord.SelectOption(label="Security & Audit", description="Set Log Channel for Suspicious Activity", emoji="🔒", value="audit")
+            discord.SelectOption(label="Audit Logs", description="Set the channel for support, salary, and admin logs", emoji="🔒", value="audit")
         ]
         super().__init__(placeholder="Select Developer Tool...", min_values=1, max_values=1, options=options)
     
@@ -1702,7 +1690,7 @@ async def dev(interaction: discord.Interaction):
     embed = discord.Embed(title="🛠️ Developer Control Center", color=discord.Color.dark_red())
     embed.add_field(name="👤 Player Man", value="Force Levels/Rebirths", inline=True)
     embed.add_field(name="🌍 Events", value="Global Multipliers", inline=True)
-    embed.add_field(name="🔒 Audit", value="Log Suspicious XP", inline=True)
+    embed.add_field(name="🔒 Audit Logs", value="Support, salary and admin activity", inline=True)
     await interaction.response.send_message(embed=embed, view=DevDashboard(), ephemeral=True)
 
 @bot.tree.command(name="force_salaries", description="Manually deploy hourly salaries to all eligible users (Admin)")

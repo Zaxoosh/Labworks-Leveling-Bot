@@ -154,7 +154,7 @@ To get the bot fully operational after installation:
 
 1. **Role Mapping:** Use `/config` -> **Manage Roles** -> **Assign to Level** to link your Discord roles to the leveling system.
 2. **Channel Routing:** Use `/config` -> **Manage Channels** -> **Route Level Ups** to keep general chat clean.
-3. **Security:** Use `/dev` -> **Security & Audit** to set a staff-only channel for logging suspicious XP gains (e.g., >150 XP per message).
+3. **Audit Logs:** Use `/dev` -> **Audit Logs** to route support workflow, salary distribution, and administrator activity logs to a staff-only channel.
 
 ---
 
